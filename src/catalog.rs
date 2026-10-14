@@ -301,6 +301,25 @@ impl Catalog {
             .collect()
     }
 
+    /// Walk `parent_id` until a [`ObjectKind::Database`] node; return its name.
+    pub fn database_name_of(&self, id: u64) -> Option<&str> {
+        let mut cur = self.by_id(id);
+        while let Some(o) = cur {
+            if o.kind == ObjectKind::Database {
+                return Some(o.name.as_str());
+            }
+            cur = o.parent_id.and_then(|p| self.by_id(p));
+        }
+        None
+    }
+
+    pub fn database_count(&self) -> usize {
+        self.objects
+            .iter()
+            .filter(|o| o.kind == ObjectKind::Database)
+            .count()
+    }
+
     /// Non-context search: scan every leaf-like object (tables/views/procs/…)
     /// analogous to NonContextFilter* builders in ObjectExplorer.
     pub fn search(&self, conditions: &SearchConditions) -> Vec<&CatalogObject> {
@@ -597,6 +616,30 @@ mod tests {
             .children(Some(idx_folder.id))
             .iter()
             .any(|o| o.kind == ObjectKind::Index));
+    }
+
+    #[test]
+    fn database_name_of_walks_to_database() {
+        let cat = Catalog::demo();
+        let table = cat
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Table && o.name == "Employee")
+            .unwrap();
+        assert_eq!(cat.database_name_of(table.id), Some("AdventureWorks"));
+        let server = cat
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .unwrap();
+        assert_eq!(cat.database_name_of(server.id), None);
+    }
+
+    #[test]
+    fn serde_deserializes_without_create_date() {
+        let json = r#"{"id":1,"parent_id":null,"kind":"Table","name":"t","schema":"dbo","owner":"dbo","urn":"u"}"#;
+        let o: CatalogObject = serde_json::from_str(json).unwrap();
+        assert!(o.create_date.is_empty());
     }
 
     #[test]

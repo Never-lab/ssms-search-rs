@@ -153,11 +153,22 @@ impl SsmsApp {
             .collect();
         if !self.status_error && self.workspace == Workspace::Explorer {
             let n = self.object_hits.len();
-            self.status = if self.conditions.is_empty() {
+            let mut status = if self.conditions.is_empty() {
                 format!("{n} object(s)")
             } else {
                 format!("{n} object(s) matching filter")
             };
+            if self.connected && !self.is_demo {
+                let total = self.catalog.database_count();
+                if total > 1 {
+                    status.push_str(&format!(
+                        " · {}/{} databases loaded",
+                        self.loaded_databases.len(),
+                        total
+                    ));
+                }
+            }
+            self.status = status;
         }
     }
 
@@ -556,18 +567,6 @@ impl SsmsApp {
         }
     }
 
-    /// Nearest Database ancestor (or self) of an object.
-    fn database_of(&self, id: u64) -> Option<&CatalogObject> {
-        let mut cur = self.catalog.by_id(id);
-        while let Some(o) = cur {
-            if o.kind == ObjectKind::Database {
-                return Some(o);
-            }
-            cur = o.parent_id.and_then(|p| self.catalog.by_id(p));
-        }
-        None
-    }
-
     fn server_name(&self) -> Option<String> {
         self.catalog
             .objects
@@ -641,7 +640,7 @@ impl SsmsApp {
         let Some(o) = self.selected_object().cloned() else {
             return;
         };
-        let Some(database) = self.database_of(o.id).map(|d| d.name.clone()) else {
+        let Some(database) = self.catalog.database_name_of(o.id).map(str::to_string) else {
             return;
         };
         let Some(args) = self.session_args.clone() else {
@@ -677,7 +676,7 @@ impl SsmsApp {
         let Some(o) = self.selected_object().cloned() else {
             return;
         };
-        let Some(database) = self.database_of(o.id).map(|d| d.name.clone()) else {
+        let Some(database) = self.catalog.database_name_of(o.id).map(str::to_string) else {
             return;
         };
         let Some(args) = self.session_args.clone() else {
@@ -752,7 +751,7 @@ impl SsmsApp {
         else {
             return;
         };
-        let Some(database) = self.database_of(table.id).map(|o| o.name.clone()) else {
+        let Some(database) = self.catalog.database_name_of(table.id).map(str::to_string) else {
             return;
         };
         let (schema, table_name) = (table.schema.clone(), table.name.clone());
@@ -923,16 +922,17 @@ impl SsmsApp {
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("results_grid")
                 .striped(true)
-                .num_columns(4)
+                .num_columns(5)
                 .min_col_width(80.0)
                 .show(ui, |ui| {
                     ui.strong("Type");
                     ui.strong("Name");
                     ui.strong("Schema");
+                    ui.strong("Database");
                     ui.strong("Owner");
                     ui.end_row();
 
-                    let rows: Vec<(u64, String, String, String, String)> = self
+                    let rows: Vec<(u64, String, String, String, String, String)> = self
                         .object_hits
                         .iter()
                         .filter_map(|id| {
@@ -942,19 +942,25 @@ impl SsmsApp {
                             } else {
                                 format!("{}.{}", o.schema, o.name)
                             };
+                            let database = self
+                                .catalog
+                                .database_name_of(o.id)
+                                .unwrap_or("")
+                                .to_string();
                             Some((
                                 *id,
                                 format!("{} {}", kind_glyph(o.kind), short_type(o.kind)),
                                 name,
                                 o.schema.clone(),
+                                database,
                                 o.owner.clone(),
                             ))
                         })
                         .collect();
 
-                    for (id, ty, name, schema, owner) in rows {
+                    for (id, ty, name, schema, database, owner) in rows {
                         let selected = self.selected_id == Some(id);
-                        for cell in [ty, name, schema, owner] {
+                        for cell in [ty, name, schema, database, owner] {
                             let resp = ui.add(
                                 egui::Label::new(RichText::new(cell).color(ssms_colors::TEXT))
                                     .sense(Sense::click()),

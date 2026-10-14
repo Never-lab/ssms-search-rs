@@ -215,11 +215,17 @@ pub async fn ensure_database_loaded(
     if catalog.objects.iter().any(|o| o.parent_id == Some(db_id)) {
         return Ok(());
     }
-    if !catalog
-        .by_id(db_id)
-        .is_some_and(|o| o.kind == ObjectKind::Database)
-    {
+    let Some(db_obj) = catalog.by_id(db_id) else {
+        bail!("object {db_id} not found in catalog");
+    };
+    if db_obj.kind != ObjectKind::Database {
         bail!("object {db_id} is not a Database node");
+    }
+    if !db_obj.name.eq_ignore_ascii_case(database) {
+        bail!(
+            "database name {database:?} does not match Database node name {:?}",
+            db_obj.name
+        );
     }
     // Build off to the side; commit only on full success so errors leave `catalog` untouched.
     let mut new = Vec::new();
