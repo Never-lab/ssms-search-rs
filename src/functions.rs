@@ -157,6 +157,19 @@ pub async fn load_server_catalog(
     prefer_database: &str,
 ) -> Result<Catalog> {
     let dbs = list_databases(client).await?;
+    let (mut catalog, db_id, db_name) = server_skeleton(server, &dbs, prefer_database)?;
+    let mut b = Builder::new(&mut catalog.objects);
+    populate_database(client, &mut b, server, &db_name, db_id).await?;
+    Ok(catalog)
+}
+
+/// Pure part of [`load_server_catalog`]: Server + one Database node per `dbs` entry.
+/// Returns the catalog plus the id/name of the (case-insensitively) preferred database.
+fn server_skeleton(
+    server: &str,
+    dbs: &[DbInfo],
+    prefer_database: &str,
+) -> Result<(Catalog, u64, String)> {
     let mut catalog = Catalog {
         objects: Vec::new(),
     };
@@ -171,7 +184,7 @@ pub async fn load_server_catalog(
         "",
     );
     let mut prefer_id = None;
-    for db in &dbs {
+    for db in dbs {
         let id = b.add(
             Some(server_id),
             ObjectKind::Database,
@@ -188,8 +201,7 @@ pub async fn load_server_catalog(
     let Some((db_id, db_name)) = prefer_id else {
         bail!("database not found or not online: {prefer_database}");
     };
-    populate_database(client, &mut b, server, &db_name, db_id).await?;
-    Ok(catalog)
+    Ok((catalog, db_id, db_name))
 }
 
 /// Populate a Database node on first expand. No-op if it already has children.
@@ -203,8 +215,21 @@ pub async fn ensure_database_loaded(
     if catalog.objects.iter().any(|o| o.parent_id == Some(db_id)) {
         return Ok(());
     }
-    let mut b = Builder::new(&mut catalog.objects);
-    populate_database(client, &mut b, server, database, db_id).await
+    if !catalog
+        .by_id(db_id)
+        .is_some_and(|o| o.kind == ObjectKind::Database)
+    {
+        bail!("object {db_id} is not a Database node");
+    }
+    // Build off to the side; commit only on full success so errors leave `catalog` untouched.
+    let mut new = Vec::new();
+    let mut b = Builder {
+        objects: &mut new,
+        next: catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1,
+    };
+    populate_database(client, &mut b, server, database, db_id).await?;
+    catalog.objects.extend(new);
+    Ok(())
 }
 
 /// Tables/views/procs/functions/synonyms/triggers folders + leaves under `db_id`.
@@ -481,11 +506,25 @@ pub async fn load_table_children(
     Ok(out)
 }
 
+/// Skip leading whitespace, `-- …` line comments and `/* … */` blocks.
+fn strip_leading_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.find('\n').map_or("", |i| &rest[i + 1..]);
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |i| &rest[i + 2..]);
+        } else {
+            return s;
+        }
+    }
+}
+
 /// Reject mutating/DDL batches used by the query helper / GUI Execute path.
 pub fn assert_readonly_sql(sql: &str) -> Result<()> {
     let upper = sql.trim().to_ascii_uppercase();
     for stmt in upper.split(';') {
-        let s = stmt.trim_start();
+        let s = strip_leading_comments(stmt);
         for banned in [
             "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "TRUNCATE", "EXEC", "EXECUTE",
             "CREATE", "GRANT", "REVOKE", "DENY",
@@ -677,8 +716,8 @@ pub async fn object_definition(
     use_database(client, database).await?;
     let stream = client
         .query(
-            "SELECT OBJECT_DEFINITION(OBJECT_ID(@P1))",
-            &[&format!("{schema}.{name}")],
+            "SELECT OBJECT_DEFINITION(OBJECT_ID(QUOTENAME(@P1) + N'.' + QUOTENAME(@P2)))",
+            &[&schema, &name],
         )
         .await?;
     let row = stream.into_row().await?.context("no definition returned")?;
@@ -689,11 +728,9 @@ pub async fn object_definition(
 }
 
 async fn use_database(client: &mut SqlClient, database: &str) -> Result<()> {
-    if !database
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ')
-    {
-        bail!("unsafe database name: {database}");
+    // Safety comes from bracket quoting (`]` -> `]]`); reject only unusable names.
+    if database.is_empty() || database.chars().count() > 128 || database.contains('\0') {
+        bail!("invalid database name: {database:?}");
     }
     let sql = format!("USE [{}]", database.replace(']', "]]"));
     client.simple_query(sql).await?.into_results().await?;
@@ -791,6 +828,94 @@ mod tests {
         assert!(assert_readonly_sql("SELECT 1; DELETE FROM t").is_err());
         assert!(assert_readonly_sql("SELECT 1;DROP TABLE t").is_err());
         assert!(assert_readonly_sql("SELECT 1; EXEC sp_x").is_err());
+    }
+
+    #[test]
+    fn readonly_ignores_leading_comments() {
+        for sql in [
+            "-- c\nDROP TABLE t",
+            "/* c */ DELETE FROM t",
+            "/* a */ -- b\n /* c */ EXEC x",
+            "SELECT 1; -- c\nEXEC x",
+        ] {
+            assert!(
+                assert_readonly_sql(sql).is_err(),
+                "expected reject for: {sql}"
+            );
+        }
+        assert!(assert_readonly_sql("-- c\nSELECT 1").is_ok());
+        assert!(assert_readonly_sql("/* c */ SELECT 1").is_ok());
+    }
+
+    fn dbs(names: &[&str]) -> Vec<DbInfo> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| DbInfo {
+                name: n.to_string(),
+                database_id: i as i32 + 1,
+                state_desc: "ONLINE".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_skeleton_has_server_and_all_databases() {
+        let (cat, db_id, name) = server_skeleton(
+            "srv",
+            &dbs(&["master", "Sales.2024", "Società"]),
+            "SALES.2024",
+        )
+        .unwrap();
+        assert_eq!(name, "Sales.2024");
+        assert_eq!(cat.objects.len(), 4);
+        let root = cat.children(None);
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].kind, ObjectKind::Server);
+        let kids = cat.children(Some(root[0].id));
+        assert_eq!(kids.len(), 3);
+        assert!(kids.iter().all(|d| d.kind == ObjectKind::Database));
+        assert_eq!(cat.by_id(db_id).unwrap().name, "Sales.2024");
+        let mut ids: Vec<_> = cat.objects.iter().map(|o| o.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(
+            cat.by_id(db_id).unwrap().urn,
+            "Server[@Name='srv']/Database[@Name='Sales.2024']"
+        );
+    }
+
+    #[test]
+    fn server_skeleton_errors_when_preferred_missing() {
+        assert!(server_skeleton("srv", &dbs(&["master"]), "nope").is_err());
+    }
+
+    #[test]
+    fn builder_continues_after_max_id_and_sets_parent() {
+        let (mut cat, _, _) = server_skeleton("s", &dbs(&["a"]), "a").unwrap();
+        let max = cat.objects.iter().map(|o| o.id).max().unwrap();
+        let mut b = Builder::new(&mut cat.objects);
+        let id = b.add(
+            Some(2),
+            ObjectKind::Folder,
+            "Tables",
+            "",
+            "",
+            "u".into(),
+            "",
+        );
+        assert_eq!(id, max + 1);
+        assert_eq!(cat.by_id(id).unwrap().parent_id, Some(2));
+    }
+
+    #[test]
+    fn urns_escape_single_quotes() {
+        assert_eq!(server_urn("o'x"), "Server[@Name='o''x']");
+        assert_eq!(
+            database_urn("s", "d'b"),
+            "Server[@Name='s']/Database[@Name='d''b']"
+        );
     }
 
     #[test]

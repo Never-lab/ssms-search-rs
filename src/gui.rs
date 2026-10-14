@@ -67,6 +67,8 @@ pub struct SsmsApp {
     connection_label: String,
     is_demo: bool,
     connected: bool,
+    /// Args of the live session; every post-connect SQL job uses these, not the form.
+    session_args: Option<ConnectArgs>,
     status: String,
     status_error: bool,
     object_hits: Vec<u64>,
@@ -109,6 +111,7 @@ impl SsmsApp {
             connection_label: "Demo catalog".into(),
             is_demo: true,
             connected: false,
+            session_args: None,
             status: "Ready — connect or use demo, then New Query".into(),
             status_error: false,
             object_hits: Vec::new(),
@@ -198,6 +201,7 @@ impl SsmsApp {
         self.selected_id = None;
         self.is_demo = true;
         self.connected = false;
+        self.session_args = None;
         self.connection_label = "Demo catalog".into();
         self.status_error = false;
         self.status = "Loaded demo catalog".into();
@@ -235,7 +239,11 @@ impl SsmsApp {
 
     /// Connect (or `refresh` an existing session: same args, keep old tree on failure).
     fn try_connect(&mut self, refresh: bool) {
-        let args = self.connect_args();
+        let args = match (refresh, self.session_args.clone()) {
+            (true, Some(a)) => a,
+            _ => self.connect_args(),
+        };
+        let session = args.clone();
         self.status_error = false;
         self.status = if refresh {
             "Refreshing…"
@@ -281,6 +289,7 @@ impl SsmsApp {
                 self.selected_id = None;
                 self.is_demo = false;
                 self.connected = true;
+                self.session_args = Some(session);
                 self.connection_label = format!("{server} · {db} · {login}");
                 self.status_error = false;
                 self.status = if refresh { "Refreshed" } else { "Connected" }.into();
@@ -306,7 +315,9 @@ impl SsmsApp {
             return;
         }
         let sql = self.sql_text.clone();
-        let args = self.connect_args();
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
         self.status = "Executing…".into();
         self.status_error = false;
 
@@ -585,7 +596,9 @@ impl SsmsApp {
             self.loaded_databases.insert(db_id);
             return;
         }
-        let args = self.connect_args();
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
         let mut catalog = self.catalog.clone();
         self.status_error = false;
         self.status = format!("Loading database {database}…");
@@ -631,7 +644,9 @@ impl SsmsApp {
         let Some(database) = self.database_of(o.id).map(|d| d.name.clone()) else {
             return;
         };
-        let args = self.connect_args();
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
         let (schema, name) = (o.schema.clone(), o.name.clone());
         self.status_error = false;
         self.status = format!("Describing {schema}.{name}…");
@@ -665,7 +680,9 @@ impl SsmsApp {
         let Some(database) = self.database_of(o.id).map(|d| d.name.clone()) else {
             return;
         };
-        let args = self.connect_args();
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
         let (schema, name) = (o.schema.clone(), o.name.clone());
         self.status_error = false;
         self.status = format!("Scripting {schema}.{name}…");
@@ -740,7 +757,9 @@ impl SsmsApp {
         };
         let (schema, table_name) = (table.schema.clone(), table.name.clone());
         let start_id = self.catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
-        let args = self.connect_args();
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
         self.status_error = false;
         self.status = format!("Loading {schema}.{table_name} columns and indexes…");
 

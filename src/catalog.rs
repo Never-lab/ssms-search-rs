@@ -67,6 +67,15 @@ impl CatalogObject {
     }
 
     pub fn matches(&self, conditions: &SearchConditions) -> bool {
+        // Objects without a known date (columns, indexes, unloaded kinds) never match a Date filter.
+        if self.create_date.is_empty()
+            && conditions
+                .items
+                .iter()
+                .any(|i| i.column.eq_ignore_ascii_case("Date") && !i.value.is_empty())
+        {
+            return false;
+        }
         conditions.matches(&self.props())
     }
 }
@@ -502,6 +511,52 @@ mod tests {
         let hits = cat.search(&sc);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "Employee");
+    }
+
+    #[test]
+    fn empty_date_never_matches_date_filters() {
+        let cat = Catalog::demo();
+        for op in FilterOperator::ALL {
+            let mut item = FilterItem::new("Date", op, "2020");
+            item.value2 = "2030".into();
+            let sc = SearchConditions { items: vec![item] };
+            let hits = cat.search(&sc);
+            assert!(
+                hits.iter().all(|o| !o.create_date.is_empty()),
+                "{op}: matched an object with empty date"
+            );
+        }
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("Date", FilterOperator::LessThan, "2020")],
+        };
+        assert_eq!(cat.search(&sc).len(), 1); // only Employee (2009)
+    }
+
+    #[test]
+    fn multi_db_catalog_structure() {
+        let mk = |id, parent_id, kind, name: &str| CatalogObject {
+            id,
+            parent_id,
+            kind,
+            name: name.into(),
+            schema: String::new(),
+            owner: String::new(),
+            urn: String::new(),
+            create_date: String::new(),
+        };
+        let cat = Catalog {
+            objects: vec![
+                mk(1, None, ObjectKind::Server, "srv"),
+                mk(2, Some(1), ObjectKind::Database, "a"),
+                mk(3, Some(1), ObjectKind::Database, "b"),
+                mk(4, Some(2), ObjectKind::Folder, "Tables"),
+            ],
+        };
+        let dbs = cat.children(Some(1));
+        assert_eq!(dbs.len(), 2);
+        // Unloaded database "b" has no children; "a" does.
+        assert!(cat.children(Some(3)).is_empty());
+        assert_eq!(cat.children(Some(2)).len(), 1);
     }
 
     #[test]
