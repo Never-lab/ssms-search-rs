@@ -1,0 +1,15 @@
+---
+description: After code changes, build release exe locally then commit
+alwaysApply: true
+---
+
+# Local build → try → commit
+
+When finishing feature/bug work in this repo (not docs-only):
+
+1. Run `.\build.ps1` only (clears stale `RUSTFLAGS`, uses `D:\mingw64`, tests + release → `release\ssms-search-rs.exe`). Do not invent alternate linkers.
+2. Confirm the script exits 0 and `release\README.txt` has a fresh Built timestamp.
+3. Leave the exe for the user to try (`release\ssms-search-rs.exe` is gitignored).
+4. Then commit code + `release\README.txt` (+ this rule if changed).
+
+Do not claim done without a successful `.\build.ps1` in the session. Do not commit `.superpowers/` or `docs/superpowers/briefs/` scratch.

@@ -9,9 +9,14 @@ Remove-Item Env:CC -ErrorAction SilentlyContinue
 Remove-Item Env:CXX -ErrorAction SilentlyContinue
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "$mingw\gcc.exe"
 Set-Location $PSScriptRoot
+# Stale RUSTFLAGS (e.g. linker=rust-lld) break mingw; always clear for this script.
+Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 cargo test
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 cargo build --release
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $exe = Join-Path $PSScriptRoot 'target\release\ssms-search-rs.exe'
+if (-not (Test-Path $exe)) { Write-Error "Missing $exe after build" }
 $rel = Join-Path $PSScriptRoot 'release'
 New-Item -ItemType Directory -Force -Path $rel | Out-Null
 Copy-Item $exe (Join-Path $rel 'ssms-search-rs.exe') -Force
