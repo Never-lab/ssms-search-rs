@@ -93,29 +93,39 @@ pub fn parse_server_host_port(server: &str, default_port: u16) -> (String, u16) 
 
 pub async fn connect(args: &ConnectArgs) -> Result<SqlClient> {
     let (host, port) = parse_server_host_port(&args.server, args.port);
-    let config = args.to_config()?;
-    let tcp = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .with_context(|| format!("TCP connect failed to {host}:{port}"))?;
-    tcp.set_nodelay(true)?;
-    let client = Client::connect(config, tcp.compat_write())
-        .await
-        .context("TDS login failed")?;
-    Ok(client)
+    crate::trace::timed_result(
+        "engine.connect",
+        format!("{host}:{port} db={}", args.database),
+        async {
+            let config = args.to_config()?;
+            let tcp = TcpStream::connect(format!("{host}:{port}"))
+                .await
+                .with_context(|| format!("TCP connect failed to {host}:{port}"))?;
+            tcp.set_nodelay(true)?;
+            let client = Client::connect(config, tcp.compat_write())
+                .await
+                .context("TDS login failed")?;
+            Ok(client)
+        },
+    )
+    .await
 }
 
 pub async fn ping(client: &mut SqlClient) -> Result<(String, String, String)> {
-    let stream = client
-        .query(
-            "SELECT @@SERVERNAME AS server_name, DB_NAME() AS db_name, SUSER_SNAME() AS login_name",
-            &[],
-        )
-        .await?;
-    let row = stream.into_row().await?.context("empty ping result")?;
-    let server: String = row.get::<&str, _>(0).unwrap_or("?").to_string();
-    let db: String = row.get::<&str, _>(1).unwrap_or("?").to_string();
-    let login: String = row.get::<&str, _>(2).unwrap_or("?").to_string();
-    Ok((server, db, login))
+    crate::trace::timed_result("engine.ping", "", async {
+        let stream = client
+            .query(
+                "SELECT @@SERVERNAME AS server_name, DB_NAME() AS db_name, SUSER_SNAME() AS login_name",
+                &[],
+            )
+            .await?;
+        let row = stream.into_row().await?.context("empty ping result")?;
+        let server: String = row.get::<&str, _>(0).unwrap_or("?").to_string();
+        let db: String = row.get::<&str, _>(1).unwrap_or("?").to_string();
+        let login: String = row.get::<&str, _>(2).unwrap_or("?").to_string();
+        Ok((server, db, login))
+    })
+    .await
 }
 
 #[cfg(test)]

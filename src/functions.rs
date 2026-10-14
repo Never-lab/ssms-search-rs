@@ -49,25 +49,28 @@ pub struct QueryExecution {
 }
 
 pub async fn list_databases(client: &mut SqlClient) -> Result<Vec<DbInfo>> {
-    let stream = client
-        .query(
-            "SELECT name, database_id, state_desc \
+    crate::trace::timed_result("engine.list_databases", "", async {
+        let stream = client
+            .query(
+                "SELECT name, database_id, state_desc \
              FROM sys.databases \
              WHERE state = 0 \
              ORDER BY name",
-            &[],
-        )
-        .await?;
-    let rows = stream.into_first_result().await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(DbInfo {
-            name: row.get::<&str, _>(0).unwrap_or("").to_string(),
-            database_id: row.get::<i32, _>(1).unwrap_or(0),
-            state_desc: row.get::<&str, _>(2).unwrap_or("").to_string(),
-        });
-    }
-    Ok(out)
+                &[],
+            )
+            .await?;
+        let rows = stream.into_first_result().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(DbInfo {
+                name: row.get::<&str, _>(0).unwrap_or("").to_string(),
+                database_id: row.get::<i32, _>(1).unwrap_or(0),
+                state_desc: row.get::<&str, _>(2).unwrap_or("").to_string(),
+            });
+        }
+        Ok(out)
+    })
+    .await
 }
 
 /// Appends catalog objects with sequential ids (caller owns the id space).
@@ -123,30 +126,37 @@ fn database_urn(server: &str, database: &str) -> String {
 
 /// Load Object Explorer-shaped catalog for one database (tables/views/procs/functions).
 pub async fn load_catalog(client: &mut SqlClient, server: &str, database: &str) -> Result<Catalog> {
-    let mut catalog = Catalog {
-        objects: Vec::new(),
-    };
-    let mut b = Builder::new(&mut catalog.objects);
-    let server_id = b.add(
-        None,
-        ObjectKind::Server,
-        server,
-        "",
-        "",
-        server_urn(server),
-        "",
-    );
-    let db_id = b.add(
-        Some(server_id),
-        ObjectKind::Database,
-        database,
-        "",
-        "",
-        database_urn(server, database),
-        "",
-    );
-    populate_database(client, &mut b, server, database, db_id).await?;
-    Ok(catalog)
+    crate::trace::timed_result(
+        "engine.load_catalog",
+        format!("{server}/{database}"),
+        async {
+            let mut catalog = Catalog {
+                objects: Vec::new(),
+            };
+            let mut b = Builder::new(&mut catalog.objects);
+            let server_id = b.add(
+                None,
+                ObjectKind::Server,
+                server,
+                "",
+                "",
+                server_urn(server),
+                "",
+            );
+            let db_id = b.add(
+                Some(server_id),
+                ObjectKind::Database,
+                database,
+                "",
+                "",
+                database_urn(server, database),
+                "",
+            );
+            populate_database(client, &mut b, server, database, db_id).await?;
+            Ok(catalog)
+        },
+    )
+    .await
 }
 
 /// Server node + every online database; only `prefer_database` is fully populated.
@@ -156,11 +166,18 @@ pub async fn load_server_catalog(
     server: &str,
     prefer_database: &str,
 ) -> Result<Catalog> {
-    let dbs = list_databases(client).await?;
-    let (mut catalog, db_id, db_name) = server_skeleton(server, &dbs, prefer_database)?;
-    let mut b = Builder::new(&mut catalog.objects);
-    populate_database(client, &mut b, server, &db_name, db_id).await?;
-    Ok(catalog)
+    crate::trace::timed_result(
+        "engine.load_server_catalog",
+        format!("{server} prefer={prefer_database}"),
+        async {
+            let dbs = list_databases(client).await?;
+            let (mut catalog, db_id, db_name) = server_skeleton(server, &dbs, prefer_database)?;
+            let mut b = Builder::new(&mut catalog.objects);
+            populate_database(client, &mut b, server, &db_name, db_id).await?;
+            Ok(catalog)
+        },
+    )
+    .await
 }
 
 /// Pure part of [`load_server_catalog`]: Server + one Database node per `dbs` entry.
@@ -215,27 +232,34 @@ pub async fn ensure_database_loaded(
     if catalog.objects.iter().any(|o| o.parent_id == Some(db_id)) {
         return Ok(());
     }
-    let Some(db_obj) = catalog.by_id(db_id) else {
-        bail!("object {db_id} not found in catalog");
-    };
-    if db_obj.kind != ObjectKind::Database {
-        bail!("object {db_id} is not a Database node");
-    }
-    if !db_obj.name.eq_ignore_ascii_case(database) {
-        bail!(
-            "database name {database:?} does not match Database node name {:?}",
-            db_obj.name
-        );
-    }
-    // Build off to the side; commit only on full success so errors leave `catalog` untouched.
-    let mut new = Vec::new();
-    let mut b = Builder {
-        objects: &mut new,
-        next: catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1,
-    };
-    populate_database(client, &mut b, server, database, db_id).await?;
-    catalog.objects.extend(new);
-    Ok(())
+    crate::trace::timed_result(
+        "engine.ensure_database_loaded",
+        format!("{server}/{database} id={db_id}"),
+        async {
+            let Some(db_obj) = catalog.by_id(db_id) else {
+                bail!("object {db_id} not found in catalog");
+            };
+            if db_obj.kind != ObjectKind::Database {
+                bail!("object {db_id} is not a Database node");
+            }
+            if !db_obj.name.eq_ignore_ascii_case(database) {
+                bail!(
+                    "database name {database:?} does not match Database node name {:?}",
+                    db_obj.name
+                );
+            }
+            // Build off to the side; commit only on full success so errors leave `catalog` untouched.
+            let mut new = Vec::new();
+            let mut b = Builder {
+                objects: &mut new,
+                next: catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1,
+            };
+            populate_database(client, &mut b, server, database, db_id).await?;
+            catalog.objects.extend(new);
+            Ok(())
+        },
+    )
+    .await
 }
 
 /// Tables/views/procs/functions/synonyms/triggers folders + leaves under `db_id`.
@@ -246,6 +270,8 @@ async fn populate_database(
     database: &str,
     db_id: u64,
 ) -> Result<()> {
+    let _span = crate::trace::Span::new("engine.populate_database")
+        .detail(format!("{server}/{database}"));
     use_database(client, database).await?;
 
     let q = "\
@@ -398,10 +424,14 @@ pub async fn describe_object(
     schema: &str,
     name: &str,
 ) -> Result<Vec<ColumnInfo>> {
-    use_database(client, database).await?;
-    let stream = client
-        .query(
-            "SELECT c.name, \
+    crate::trace::timed_result(
+        "engine.describe_object",
+        format!("{database}.{schema}.{name}"),
+        async {
+            use_database(client, database).await?;
+            let stream = client
+                .query(
+                    "SELECT c.name, \
                     t.name AS type_name, \
                     c.max_length, \
                     c.is_nullable \
@@ -411,22 +441,25 @@ pub async fn describe_object(
              INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id \
              WHERE s.name = @P1 AND o.name = @P2 \
              ORDER BY c.column_id",
-            &[&schema, &name],
-        )
-        .await?;
-    let rows = stream.into_first_result().await?;
-    if rows.is_empty() {
-        bail!("object not found or has no columns: {schema}.{name}");
-    }
-    Ok(rows
-        .into_iter()
-        .map(|row| ColumnInfo {
-            name: row.get::<&str, _>(0).unwrap_or("").to_string(),
-            data_type: row.get::<&str, _>(1).unwrap_or("").to_string(),
-            max_length: row.get::<i16, _>(2).unwrap_or(0),
-            is_nullable: row.get::<bool, _>(3).unwrap_or(false),
-        })
-        .collect())
+                    &[&schema, &name],
+                )
+                .await?;
+            let rows = stream.into_first_result().await?;
+            if rows.is_empty() {
+                bail!("object not found or has no columns: {schema}.{name}");
+            }
+            Ok(rows
+                .into_iter()
+                .map(|row| ColumnInfo {
+                    name: row.get::<&str, _>(0).unwrap_or("").to_string(),
+                    data_type: row.get::<&str, _>(1).unwrap_or("").to_string(),
+                    max_length: row.get::<i16, _>(2).unwrap_or(0),
+                    is_nullable: row.get::<bool, _>(3).unwrap_or(false),
+                })
+                .collect())
+        },
+    )
+    .await
 }
 
 /// Load Columns and Indexes leaves for one table. Ids start at `start_id` (caller owns id space).
@@ -441,75 +474,82 @@ pub async fn load_table_children(
     indexes_folder_id: u64,
     start_id: u64,
 ) -> Result<Vec<CatalogObject>> {
-    use_database(client, database).await?;
-    let table_urn = format!(
-        "Server[@Name='{}']/Database[@Name='{}']/Table[@Name='{}' and @Schema='{}']",
-        escape_urn(server),
-        escape_urn(database),
-        escape_urn(table_name),
-        escape_urn(schema)
-    );
-    let mut out = Vec::new();
-    let mut next = start_id;
-    let mut push = |parent: u64, kind: ObjectKind, name: &str, leaf: &str| {
-        out.push(CatalogObject {
-            id: next,
-            parent_id: Some(parent),
-            kind,
-            name: name.to_string(),
-            schema: schema.to_string(),
-            owner: String::new(),
-            urn: child_leaf_urn(&table_urn, leaf, name),
-            create_date: String::new(),
-        });
-        next += 1;
-    };
+    crate::trace::timed_result(
+        "engine.load_table_children",
+        format!("{database}.{schema}.{table_name}"),
+        async {
+            use_database(client, database).await?;
+            let table_urn = format!(
+                "Server[@Name='{}']/Database[@Name='{}']/Table[@Name='{}' and @Schema='{}']",
+                escape_urn(server),
+                escape_urn(database),
+                escape_urn(table_name),
+                escape_urn(schema)
+            );
+            let mut out = Vec::new();
+            let mut next = start_id;
+            let mut push = |parent: u64, kind: ObjectKind, name: &str, leaf: &str| {
+                out.push(CatalogObject {
+                    id: next,
+                    parent_id: Some(parent),
+                    kind,
+                    name: name.to_string(),
+                    schema: schema.to_string(),
+                    owner: String::new(),
+                    urn: child_leaf_urn(&table_urn, leaf, name),
+                    create_date: String::new(),
+                });
+                next += 1;
+            };
 
-    let cols = client
-        .query(
-            "SELECT c.name \
+            let cols = client
+                .query(
+                    "SELECT c.name \
              FROM sys.columns AS c \
              INNER JOIN sys.types AS t ON c.user_type_id = t.user_type_id \
              INNER JOIN sys.objects AS o ON c.object_id = o.object_id \
              INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id \
              WHERE s.name = @P1 AND o.name = @P2 \
              ORDER BY c.column_id",
-            &[&schema, &table_name],
-        )
-        .await?
-        .into_first_result()
-        .await?;
-    for row in cols {
-        push(
-            columns_folder_id,
-            ObjectKind::Column,
-            row.get::<&str, _>(0).unwrap_or(""),
-            "Column",
-        );
-    }
+                    &[&schema, &table_name],
+                )
+                .await?
+                .into_first_result()
+                .await?;
+            for row in cols {
+                push(
+                    columns_folder_id,
+                    ObjectKind::Column,
+                    row.get::<&str, _>(0).unwrap_or(""),
+                    "Column",
+                );
+            }
 
-    let idx = client
-        .query(
-            "SELECT i.name \
+            let idx = client
+                .query(
+                    "SELECT i.name \
              FROM sys.indexes AS i \
              INNER JOIN sys.tables AS t ON i.object_id = t.object_id \
              INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id \
              WHERE s.name = @P1 AND t.name = @P2 AND i.index_id > 0 AND i.name IS NOT NULL \
              ORDER BY i.name",
-            &[&schema, &table_name],
-        )
-        .await?
-        .into_first_result()
-        .await?;
-    for row in idx {
-        push(
-            indexes_folder_id,
-            ObjectKind::Index,
-            row.get::<&str, _>(0).unwrap_or(""),
-            "Index",
-        );
-    }
-    Ok(out)
+                    &[&schema, &table_name],
+                )
+                .await?
+                .into_first_result()
+                .await?;
+            for row in idx {
+                push(
+                    indexes_folder_id,
+                    ObjectKind::Index,
+                    row.get::<&str, _>(0).unwrap_or(""),
+                    "Index",
+                );
+            }
+            Ok(out)
+        },
+    )
+    .await
 }
 
 /// Skip leading whitespace, `-- …` line comments and `/* … */` blocks.
@@ -571,81 +611,106 @@ pub async fn run_query_ex(
     }
     assert_readonly_sql(trimmed)?;
 
-    let mut messages = Vec::new();
-    let started = Instant::now();
+    let plan_label = match plan_mode {
+        PlanMode::None => "none",
+        PlanMode::Estimated => "estimated",
+        PlanMode::Actual => "actual",
+    };
+    crate::trace::timed_result(
+        "engine.run_query_ex",
+        format!("plan={plan_label} max_rows={max_rows} bytes={}", trimmed.len()),
+        async {
+            let mut messages = Vec::new();
+            let started = Instant::now();
 
-    match plan_mode {
-        PlanMode::None => {}
-        PlanMode::Estimated => {
-            client
-                .simple_query("SET SHOWPLAN_XML ON;")
-                .await?
-                .into_results()
-                .await?;
-            messages.push("SET SHOWPLAN_XML ON — estimated plan (query not executed)".into());
-        }
-        PlanMode::Actual => {
-            client
-                .simple_query("SET STATISTICS XML ON;")
-                .await?
-                .into_results()
-                .await?;
-            messages.push("SET STATISTICS XML ON — actual execution plan".into());
-        }
-    }
-
-    let batch_result = collect_query_streams(client, trimmed, max_rows).await;
-
-    // Always try to turn plan settings off (best-effort).
-    match plan_mode {
-        PlanMode::None => {}
-        PlanMode::Estimated => {
-            if let Ok(s) = client.simple_query("SET SHOWPLAN_XML OFF;").await {
-                let _ = s.into_results().await;
+            {
+                let _span = crate::trace::Span::new("engine.run_query_ex.plan_on")
+                    .detail(plan_label.to_string());
+                match plan_mode {
+                    PlanMode::None => {}
+                    PlanMode::Estimated => {
+                        client
+                            .simple_query("SET SHOWPLAN_XML ON;")
+                            .await?
+                            .into_results()
+                            .await?;
+                        messages.push(
+                            "SET SHOWPLAN_XML ON — estimated plan (query not executed)".into(),
+                        );
+                    }
+                    PlanMode::Actual => {
+                        client
+                            .simple_query("SET STATISTICS XML ON;")
+                            .await?
+                            .into_results()
+                            .await?;
+                        messages.push("SET STATISTICS XML ON — actual execution plan".into());
+                    }
+                }
             }
-        }
-        PlanMode::Actual => {
-            if let Ok(s) = client.simple_query("SET STATISTICS XML OFF;").await {
-                let _ = s.into_results().await;
+
+            let batch_result = {
+                let _span = crate::trace::Span::new("engine.run_query_ex.collect");
+                collect_query_streams(client, trimmed, max_rows).await
+            };
+
+            {
+                let _span = crate::trace::Span::new("engine.run_query_ex.plan_off");
+                match plan_mode {
+                    PlanMode::None => {}
+                    PlanMode::Estimated => {
+                        if let Ok(s) = client.simple_query("SET SHOWPLAN_XML OFF;").await {
+                            let _ = s.into_results().await;
+                        }
+                    }
+                    PlanMode::Actual => {
+                        if let Ok(s) = client.simple_query("SET STATISTICS XML OFF;").await {
+                            let _ = s.into_results().await;
+                        }
+                    }
+                }
             }
-        }
-    }
 
-    let (mut result, mut plan_xml, mut extra_msgs) = batch_result?;
-    messages.append(&mut extra_msgs);
+            let (mut result, mut plan_xml, mut extra_msgs) = batch_result?;
+            messages.append(&mut extra_msgs);
 
-    // SHOWPLAN returns plan as the only "result" — often one XML column.
-    if plan_xml.is_none() {
-        if let Some(xml) = extract_plan_from_result(&result) {
-            plan_xml = Some(xml);
-            if plan_mode == PlanMode::Estimated {
-                result = QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                };
+            if plan_xml.is_none() {
+                if let Some(xml) = extract_plan_from_result(&result) {
+                    plan_xml = Some(xml);
+                    if plan_mode == PlanMode::Estimated {
+                        result = QueryResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                        };
+                    }
+                }
             }
-        }
-    }
 
-    let plan_operators = plan_xml
-        .as_deref()
-        .map(parse_showplan_operators)
-        .unwrap_or_default();
+            let plan_operators = {
+                let _span = crate::trace::Span::new("engine.run_query_ex.parse_plan");
+                plan_xml
+                    .as_deref()
+                    .map(parse_showplan_operators)
+                    .unwrap_or_default()
+            };
 
-    let elapsed_ms = started.elapsed().as_millis();
-    messages.push(format!(
-        "Done in {elapsed_ms} ms — {} row(s), {} plan operator(s)",
-        result.rows.len(),
-        plan_operators.len()
-    ));
+            let elapsed_ms = started.elapsed().as_millis();
+            messages.push(format!(
+                "Done in {elapsed_ms} ms — {} row(s), {} plan operator(s)",
+                result.rows.len(),
+                plan_operators.len()
+            ));
 
-    Ok(QueryExecution {
-        result,
-        messages,
-        plan_xml,
-        plan_operators,
-        elapsed_ms,
-    })
+            Ok(QueryExecution {
+                result,
+                messages,
+                plan_xml,
+                plan_operators,
+                elapsed_ms,
+            })
+        },
+    )
+    .await
 }
 
 async fn collect_query_streams(
@@ -719,28 +784,40 @@ pub async fn object_definition(
     schema: &str,
     name: &str,
 ) -> Result<String> {
-    use_database(client, database).await?;
-    let stream = client
-        .query(
-            "SELECT OBJECT_DEFINITION(OBJECT_ID(QUOTENAME(@P1) + N'.' + QUOTENAME(@P2)))",
-            &[&schema, &name],
-        )
-        .await?;
-    let row = stream.into_row().await?.context("no definition returned")?;
-    match row.get::<&str, _>(0) {
-        Some(s) if !s.is_empty() => Ok(s.to_string()),
-        _ => bail!("no MODULE definition for {schema}.{name} (tables have no OBJECT_DEFINITION)"),
-    }
+    crate::trace::timed_result(
+        "engine.object_definition",
+        format!("{database}.{schema}.{name}"),
+        async {
+            use_database(client, database).await?;
+            let stream = client
+                .query(
+                    "SELECT OBJECT_DEFINITION(OBJECT_ID(QUOTENAME(@P1) + N'.' + QUOTENAME(@P2)))",
+                    &[&schema, &name],
+                )
+                .await?;
+            let row = stream.into_row().await?.context("no definition returned")?;
+            match row.get::<&str, _>(0) {
+                Some(s) if !s.is_empty() => Ok(s.to_string()),
+                _ => {
+                    bail!("no MODULE definition for {schema}.{name} (tables have no OBJECT_DEFINITION)")
+                }
+            }
+        },
+    )
+    .await
 }
 
 async fn use_database(client: &mut SqlClient, database: &str) -> Result<()> {
-    // Safety comes from bracket quoting (`]` -> `]]`); reject only unusable names.
-    if database.is_empty() || database.chars().count() > 128 || database.contains('\0') {
-        bail!("invalid database name: {database:?}");
-    }
-    let sql = format!("USE [{}]", database.replace(']', "]]"));
-    client.simple_query(sql).await?.into_results().await?;
-    Ok(())
+    crate::trace::timed_result("engine.use_database", database.to_string(), async {
+        // Safety comes from bracket quoting (`]` -> `]]`); reject only unusable names.
+        if database.is_empty() || database.chars().count() > 128 || database.contains('\0') {
+            bail!("invalid database name: {database:?}");
+        }
+        let sql = format!("USE [{}]", database.replace(']', "]]"));
+        client.simple_query(sql).await?.into_results().await?;
+        Ok(())
+    })
+    .await
 }
 
 fn table_child_folder_urn(table_urn: &str, folder: &str) -> String {

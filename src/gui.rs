@@ -402,6 +402,22 @@ impl SsmsApp {
         ctx.set_style(style);
     }
 
+    fn show_engine_trace(&mut self) {
+        let report = ssms_search_rs::format_engine_trace();
+        self.query_messages = report.lines().map(|l| l.to_string()).collect();
+        if self.query_messages.is_empty() {
+            self.query_messages
+                .push("No engine trace events yet.".into());
+        }
+        self.workspace = Workspace::Query;
+        self.query_bottom = QueryBottomTab::Messages;
+        self.status_error = false;
+        self.status = format!(
+            "Engine trace — {} event(s)",
+            ssms_search_rs::engine_trace_snapshot().len()
+        );
+    }
+
     fn draw_menu(&mut self, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -456,6 +472,17 @@ impl SsmsApp {
                 }
                 if ui.button("Filter Settings…").clicked() {
                     self.show_filter = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Engine Trace…").clicked() {
+                    self.show_engine_trace();
+                    ui.close_menu();
+                }
+                if ui.button("Clear Engine Trace").clicked() {
+                    ssms_search_rs::clear_engine_trace();
+                    self.status = "Engine trace cleared".into();
+                    self.status_error = false;
                     ui.close_menu();
                 }
                 if ui.button("Clear Filter").clicked() {

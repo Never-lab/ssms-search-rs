@@ -2,7 +2,15 @@
 
 Desktop **Object Explorer** inspired by SSMS, built with **egui/eframe** (finestra nativa Windows) + toolkit SQL Server in Rust.
 
+**Status:** `0.6.0-alpha.1` — first public alpha Windows build.
+
 Evidence SSMS 22: [docs/EVIDENCE.md](docs/EVIDENCE.md).
+
+## Engine trace (perf)
+
+Every core SQL path records elapsed ms (`engine.connect`, `engine.load_server_catalog`, `engine.run_query_ex`, …). Spans also print to stderr.
+
+In the GUI: **View → Engine Trace…** (opens Messages) · **View → Clear Engine Trace**.
 
 ## Perché egui
 
