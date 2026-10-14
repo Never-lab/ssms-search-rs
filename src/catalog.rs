@@ -451,6 +451,17 @@ mod tests {
     }
 
     #[test]
+    fn search_type_synonym() {
+        let cat = Catalog::demo();
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("Type", FilterOperator::Equal, "Synonym")],
+        };
+        let hits = cat.search(&sc);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|o| o.kind == ObjectKind::Synonym));
+    }
+
+    #[test]
     fn catalog_object_props_order() {
         let o = CatalogObject {
             id: 1,

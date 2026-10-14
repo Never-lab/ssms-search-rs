@@ -1,7 +1,7 @@
 # Object Explorer catalog children — design
 
 Date: 2026-10-14  
-Status: approved (dialogue) → pending implementation plan  
+Status: implemented  
 Repo: `ssms-search-rs` v0.5.1
 
 ## Goal
