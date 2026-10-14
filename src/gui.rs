@@ -6,7 +6,7 @@ use eframe::egui::{
 };
 use ssms_search_rs::connection::{connect, ping, ConnectArgs};
 use ssms_search_rs::filter::{FilterItem, FilterOperator, SearchConditions};
-use ssms_search_rs::functions::{self, PlanMode, QueryExecution, QueryResult};
+use ssms_search_rs::functions::{self, ColumnInfo, PlanMode, QueryExecution, QueryResult};
 use ssms_search_rs::plan::PlanOperator;
 use ssms_search_rs::{Catalog, CatalogObject, ObjectKind};
 use std::collections::HashSet;
@@ -49,6 +49,9 @@ pub struct SsmsApp {
     catalog: Catalog,
     expanded: HashSet<u64>,
     loaded_folders: HashSet<u64>,
+    loaded_databases: HashSet<u64>,
+    /// Columns from "Describe columns…" for the object id.
+    described: Option<(u64, Vec<ColumnInfo>)>,
     selected_id: Option<u64>,
     workspace: Workspace,
     explorer_tab: ExplorerTab,
@@ -89,6 +92,8 @@ impl SsmsApp {
             catalog,
             expanded,
             loaded_folders: HashSet::new(),
+            loaded_databases: HashSet::new(),
+            described: None,
             selected_id: None,
             workspace: Workspace::Explorer,
             explorer_tab: ExplorerTab::ObjectExplorerDetails,
@@ -185,6 +190,8 @@ impl SsmsApp {
         self.catalog = Catalog::demo();
         self.expanded.clear();
         self.loaded_folders.clear();
+        self.loaded_databases.clear();
+        self.described = None;
         if let Some(root) = self.catalog.children(None).first() {
             self.expanded.insert(root.id);
         }
@@ -209,7 +216,10 @@ impl SsmsApp {
             .name("ssms-sql".into())
             .spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)))
             .map_err(|e| format!("spawn sql thread: {e}"))?;
-        match handle.join().map_err(|_| "SQL worker thread join failed".to_string())? {
+        match handle
+            .join()
+            .map_err(|_| "SQL worker thread join failed".to_string())?
+        {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(format!("{e:#}")),
             Err(panic) => {
@@ -223,10 +233,16 @@ impl SsmsApp {
         }
     }
 
-    fn try_connect(&mut self) {
+    /// Connect (or `refresh` an existing session: same args, keep old tree on failure).
+    fn try_connect(&mut self, refresh: bool) {
         let args = self.connect_args();
         self.status_error = false;
-        self.status = "Connecting…".into();
+        self.status = if refresh {
+            "Refreshing…"
+        } else {
+            "Connecting…"
+        }
+        .into();
 
         let result = self.sql_job(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -236,7 +252,8 @@ impl SsmsApp {
             rt.block_on(async {
                 let mut client = connect(&args).await?;
                 let (server, db, login) = ping(&mut client).await?;
-                let catalog = functions::load_catalog(&mut client, &server, &args.database).await?;
+                let catalog =
+                    functions::load_server_catalog(&mut client, &server, &args.database).await?;
                 Ok::<_, anyhow::Error>((catalog, server, db, login))
             })
         });
@@ -246,22 +263,37 @@ impl SsmsApp {
                 self.catalog = catalog;
                 self.expanded.clear();
                 self.loaded_folders.clear();
+                self.loaded_databases.clear();
+                self.described = None;
                 if let Some(root) = self.catalog.children(None).first() {
                     self.expanded.insert(root.id);
+                    // The preferred database arrives fully populated: expand it.
+                    let preloaded: Vec<u64> = self
+                        .catalog
+                        .children(Some(root.id))
+                        .into_iter()
+                        .filter(|d| !self.catalog.children(Some(d.id)).is_empty())
+                        .map(|d| d.id)
+                        .collect();
+                    self.expanded.extend(&preloaded);
+                    self.loaded_databases.extend(preloaded);
                 }
                 self.selected_id = None;
                 self.is_demo = false;
                 self.connected = true;
                 self.connection_label = format!("{server} · {db} · {login}");
                 self.status_error = false;
-                self.status = "Connected".into();
+                self.status = if refresh { "Refreshed" } else { "Connected" }.into();
                 self.show_connect = false;
                 self.refresh_object_hits();
             }
             Err(e) => {
-                self.connected = false;
+                self.connected = refresh && self.connected;
                 self.status_error = true;
-                self.status = format!("Connect failed: {e}");
+                self.status = format!(
+                    "{} failed: {e}",
+                    if refresh { "Refresh" } else { "Connect" }
+                );
             }
         }
     }
@@ -354,6 +386,13 @@ impl SsmsApp {
                     self.show_connect = true;
                     ui.close_menu();
                 }
+                if ui
+                    .add_enabled(self.connected, egui::Button::new("Refresh"))
+                    .clicked()
+                {
+                    self.try_connect(true);
+                    ui.close_menu();
+                }
                 if ui.button("Load Demo Catalog").clicked() {
                     self.load_demo();
                     ui.close_menu();
@@ -426,6 +465,13 @@ impl SsmsApp {
             {
                 self.show_connect = true;
             }
+            if ui
+                .add_enabled(self.connected, egui::Button::new("🔄 Refresh"))
+                .on_hover_text("Reload databases and objects (no reconnect dialog)")
+                .clicked()
+            {
+                self.try_connect(true);
+            }
             ui.separator();
             if ui
                 .add(egui::Button::new(RichText::new("🗒 New Query").strong()))
@@ -494,7 +540,155 @@ impl SsmsApp {
             self.expanded.remove(&id);
         } else {
             self.expanded.insert(id);
+            self.load_database_children(id);
             self.load_folder_children(id);
+        }
+    }
+
+    /// Nearest Database ancestor (or self) of an object.
+    fn database_of(&self, id: u64) -> Option<&CatalogObject> {
+        let mut cur = self.catalog.by_id(id);
+        while let Some(o) = cur {
+            if o.kind == ObjectKind::Database {
+                return Some(o);
+            }
+            cur = o.parent_id.and_then(|p| self.catalog.by_id(p));
+        }
+        None
+    }
+
+    fn server_name(&self) -> Option<String> {
+        self.catalog
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .map(|o| o.name.clone())
+    }
+
+    /// Populate a live Database node the first time it is expanded.
+    fn load_database_children(&mut self, db_id: u64) {
+        if self.is_demo || !self.connected || self.loaded_databases.contains(&db_id) {
+            return;
+        }
+        let Some(db) = self
+            .catalog
+            .by_id(db_id)
+            .filter(|o| o.kind == ObjectKind::Database)
+        else {
+            return;
+        };
+        let database = db.name.clone();
+        let Some(server) = self.server_name() else {
+            return;
+        };
+        if !self.catalog.children(Some(db_id)).is_empty() {
+            self.loaded_databases.insert(db_id);
+            return;
+        }
+        let args = self.connect_args();
+        let mut catalog = self.catalog.clone();
+        self.status_error = false;
+        self.status = format!("Loading database {database}…");
+
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::ensure_database_loaded(
+                    &mut client,
+                    &server,
+                    &database,
+                    &mut catalog,
+                    db_id,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((catalog, database))
+            })
+        });
+
+        match result {
+            Ok((catalog, database)) => {
+                self.catalog = catalog;
+                self.loaded_databases.insert(db_id);
+                self.status = format!("Loaded database {database}");
+                self.refresh_object_hits();
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Load database failed: {e}");
+            }
+        }
+    }
+
+    /// Properties → "Describe columns…" (Table/View).
+    fn describe_selected(&mut self) {
+        let Some(o) = self.selected_object().cloned() else {
+            return;
+        };
+        let Some(database) = self.database_of(o.id).map(|d| d.name.clone()) else {
+            return;
+        };
+        let args = self.connect_args();
+        let (schema, name) = (o.schema.clone(), o.name.clone());
+        self.status_error = false;
+        self.status = format!("Describing {schema}.{name}…");
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::describe_object(&mut client, &database, &schema, &name).await
+            })
+        });
+        match result {
+            Ok(cols) => {
+                self.status = format!("{} column(s) for {}.{}", cols.len(), o.schema, o.name);
+                self.described = Some((o.id, cols));
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Describe failed: {e}");
+            }
+        }
+    }
+
+    /// Properties → "Script definition…" (Procedure/Function/View/Trigger) into the query editor.
+    fn script_selected(&mut self) {
+        let Some(o) = self.selected_object().cloned() else {
+            return;
+        };
+        let Some(database) = self.database_of(o.id).map(|d| d.name.clone()) else {
+            return;
+        };
+        let args = self.connect_args();
+        let (schema, name) = (o.schema.clone(), o.name.clone());
+        self.status_error = false;
+        self.status = format!("Scripting {schema}.{name}…");
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::object_definition(&mut client, &database, &schema, &name).await
+            })
+        });
+        match result {
+            Ok(sql) => {
+                self.sql_text = sql;
+                self.new_query();
+                self.status = format!("Scripted {}.{}", o.schema, o.name);
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Script failed: {e}");
+            }
         }
     }
 
@@ -541,13 +735,7 @@ impl SsmsApp {
         else {
             return;
         };
-        let Some(database) = self
-            .catalog
-            .objects
-            .iter()
-            .find(|o| o.kind == ObjectKind::Database)
-            .map(|o| o.name.clone())
-        else {
+        let Some(database) = self.database_of(table.id).map(|o| o.name.clone()) else {
             return;
         };
         let (schema, table_name) = (table.schema.clone(), table.name.clone());
@@ -774,14 +962,9 @@ impl SsmsApp {
     }
 
     fn draw_properties(&mut self, ui: &mut egui::Ui) {
-        if let Some(o) = self.selected_object() {
-            let rows = [
-                ("Name", o.name.as_str()),
-                ("Schema", o.schema.as_str()),
-                ("Owner", o.owner.as_str()),
-                ("Type", o.kind.as_str()),
-                ("URN", o.urn.as_str()),
-            ];
+        if let Some(o) = self.selected_object().cloned() {
+            let mut rows = o.props().to_vec();
+            rows.push(("URN", o.urn.as_str()));
             egui::Grid::new("props_grid")
                 .num_columns(2)
                 .spacing([12.0, 6.0])
@@ -793,14 +976,57 @@ impl SsmsApp {
                     }
                 });
             ui.add_space(8.0);
-            if ui.button("Script as SELECT TOP 100…").clicked() {
-                let q = if o.schema.is_empty() {
-                    format!("SELECT TOP (100) *\nFROM [{}];\n", o.name)
-                } else {
-                    format!("SELECT TOP (100) *\nFROM [{}].[{}];\n", o.schema, o.name)
-                };
-                self.sql_text = q;
-                self.new_query();
+            let table_like = matches!(o.kind, ObjectKind::Table | ObjectKind::View);
+            let module = matches!(
+                o.kind,
+                ObjectKind::Procedure
+                    | ObjectKind::Function
+                    | ObjectKind::View
+                    | ObjectKind::Trigger
+            );
+            ui.horizontal(|ui| {
+                if table_like && ui.button("Script as SELECT TOP 100…").clicked() {
+                    self.sql_text =
+                        format!("SELECT TOP (100) *\nFROM [{}].[{}];\n", o.schema, o.name);
+                    self.new_query();
+                }
+                if table_like
+                    && ui
+                        .add_enabled(self.connected, egui::Button::new("Describe columns…"))
+                        .on_disabled_hover_text("Connect to a SQL Server first")
+                        .clicked()
+                {
+                    self.describe_selected();
+                }
+                if module
+                    && ui
+                        .add_enabled(self.connected, egui::Button::new("Script definition…"))
+                        .on_disabled_hover_text("Connect to a SQL Server first")
+                        .clicked()
+                {
+                    self.script_selected();
+                }
+            });
+            if let Some((_, cols)) = self.described.as_ref().filter(|(id, _)| *id == o.id) {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Columns").color(ssms_colors::TITLE).strong());
+                egui::Grid::new("describe_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        for h in ["Name", "Type", "Max length", "Nullable"] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for c in cols {
+                            ui.label(&c.name);
+                            ui.label(&c.data_type);
+                            ui.label(c.max_length.to_string());
+                            ui.label(if c.is_nullable { "yes" } else { "no" });
+                            ui.end_row();
+                        }
+                    });
             }
         } else {
             ui.label(
@@ -1025,7 +1251,7 @@ impl SsmsApp {
                         )
                         .clicked()
                     {
-                        self.try_connect();
+                        self.try_connect(false);
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_connect = false;
@@ -1059,7 +1285,7 @@ impl SsmsApp {
                         egui::ComboBox::from_id_salt("filter_col")
                             .selected_text(&self.filter_draft.column)
                             .show_ui(ui, |ui| {
-                                for c in ["Name", "Schema", "Owner", "Type"] {
+                                for c in ["Name", "Schema", "Owner", "Type", "Date"] {
                                     ui.selectable_value(
                                         &mut self.filter_draft.column,
                                         c.to_string(),

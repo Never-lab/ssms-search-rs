@@ -70,15 +70,159 @@ pub async fn list_databases(client: &mut SqlClient) -> Result<Vec<DbInfo>> {
     Ok(out)
 }
 
+/// Appends catalog objects with sequential ids (caller owns the id space).
+struct Builder<'a> {
+    objects: &'a mut Vec<CatalogObject>,
+    next: u64,
+}
+
+impl<'a> Builder<'a> {
+    fn new(objects: &'a mut Vec<CatalogObject>) -> Self {
+        let next = objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+        Self { objects, next }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        parent: Option<u64>,
+        kind: ObjectKind,
+        name: &str,
+        schema: &str,
+        owner: &str,
+        urn: String,
+        create_date: &str,
+    ) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.objects.push(CatalogObject {
+            id,
+            parent_id: parent,
+            kind,
+            name: name.to_string(),
+            schema: schema.to_string(),
+            owner: owner.to_string(),
+            urn,
+            create_date: create_date.to_string(),
+        });
+        id
+    }
+}
+
+fn server_urn(server: &str) -> String {
+    format!("Server[@Name='{}']", escape_urn(server))
+}
+
+fn database_urn(server: &str, database: &str) -> String {
+    format!(
+        "{}/Database[@Name='{}']",
+        server_urn(server),
+        escape_urn(database)
+    )
+}
+
 /// Load Object Explorer-shaped catalog for one database (tables/views/procs/functions).
 pub async fn load_catalog(client: &mut SqlClient, server: &str, database: &str) -> Result<Catalog> {
+    let mut catalog = Catalog {
+        objects: Vec::new(),
+    };
+    let mut b = Builder::new(&mut catalog.objects);
+    let server_id = b.add(
+        None,
+        ObjectKind::Server,
+        server,
+        "",
+        "",
+        server_urn(server),
+        "",
+    );
+    let db_id = b.add(
+        Some(server_id),
+        ObjectKind::Database,
+        database,
+        "",
+        "",
+        database_urn(server, database),
+        "",
+    );
+    populate_database(client, &mut b, server, database, db_id).await?;
+    Ok(catalog)
+}
+
+/// Server node + every online database; only `prefer_database` is fully populated.
+/// Other databases are filled lazily via [`ensure_database_loaded`].
+pub async fn load_server_catalog(
+    client: &mut SqlClient,
+    server: &str,
+    prefer_database: &str,
+) -> Result<Catalog> {
+    let dbs = list_databases(client).await?;
+    let mut catalog = Catalog {
+        objects: Vec::new(),
+    };
+    let mut b = Builder::new(&mut catalog.objects);
+    let server_id = b.add(
+        None,
+        ObjectKind::Server,
+        server,
+        "",
+        "",
+        server_urn(server),
+        "",
+    );
+    let mut prefer_id = None;
+    for db in &dbs {
+        let id = b.add(
+            Some(server_id),
+            ObjectKind::Database,
+            &db.name,
+            "",
+            "",
+            database_urn(server, &db.name),
+            "",
+        );
+        if db.name.eq_ignore_ascii_case(prefer_database) {
+            prefer_id = Some((id, db.name.clone()));
+        }
+    }
+    let Some((db_id, db_name)) = prefer_id else {
+        bail!("database not found or not online: {prefer_database}");
+    };
+    populate_database(client, &mut b, server, &db_name, db_id).await?;
+    Ok(catalog)
+}
+
+/// Populate a Database node on first expand. No-op if it already has children.
+pub async fn ensure_database_loaded(
+    client: &mut SqlClient,
+    server: &str,
+    database: &str,
+    catalog: &mut Catalog,
+    db_id: u64,
+) -> Result<()> {
+    if catalog.objects.iter().any(|o| o.parent_id == Some(db_id)) {
+        return Ok(());
+    }
+    let mut b = Builder::new(&mut catalog.objects);
+    populate_database(client, &mut b, server, database, db_id).await
+}
+
+/// Tables/views/procs/functions/synonyms/triggers folders + leaves under `db_id`.
+async fn populate_database(
+    client: &mut SqlClient,
+    b: &mut Builder<'_>,
+    server: &str,
+    database: &str,
+    db_id: u64,
+) -> Result<()> {
     use_database(client, database).await?;
 
     let q = "\
 SELECT s.name AS schema_name, \
        o.name AS object_name, \
        o.type AS type_code, \
-       ISNULL(USER_NAME(o.principal_id), s.name) AS owner_name \
+       ISNULL(USER_NAME(o.principal_id), s.name) AS owner_name, \
+       CONVERT(varchar(33), o.create_date, 126) AS create_date \
 FROM sys.objects AS o \
 INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id \
 WHERE o.is_ms_shipped = 0 \
@@ -90,85 +234,29 @@ ORDER BY \
     let stream = client.query(q, &[]).await?;
     let rows = stream.into_first_result().await?;
 
-    let mut objects = Vec::new();
-    let mut next = 1u64;
-    let mut add = |parent: Option<u64>,
-                   kind: ObjectKind,
-                   name: &str,
-                   schema: &str,
-                   owner: &str,
-                   urn: String|
-     -> u64 {
-        let id = next;
-        next += 1;
-        objects.push(CatalogObject {
-            id,
-            parent_id: parent,
-            kind,
-            name: name.to_string(),
-            schema: schema.to_string(),
-            owner: owner.to_string(),
-            urn,
-        });
-        id
+    let db_urn = database_urn(server, database);
+    let folder = |b: &mut Builder<'_>, name: &str, urn_kind: &str| {
+        b.add(
+            Some(db_id),
+            ObjectKind::Folder,
+            name,
+            "",
+            "",
+            format!("{db_urn}/{urn_kind}"),
+            "",
+        )
     };
-
-    let server_esc = escape_urn(server);
-    let db_esc = escape_urn(database);
-    let server_id = add(
-        None,
-        ObjectKind::Server,
-        server,
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']"),
-    );
-    let db_id = add(
-        Some(server_id),
-        ObjectKind::Database,
-        database,
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']"),
-    );
-    let tables_id = add(
-        Some(db_id),
-        ObjectKind::Folder,
-        "Tables",
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Table"),
-    );
-    let views_id = add(
-        Some(db_id),
-        ObjectKind::Folder,
-        "Views",
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/View"),
-    );
-    let procs_id = add(
-        Some(db_id),
-        ObjectKind::Folder,
-        "Stored Procedures",
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/StoredProcedure"),
-    );
-    let funcs_id = add(
-        Some(db_id),
-        ObjectKind::Folder,
-        "Functions",
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/UserDefinedFunction"),
-    );
+    let tables_id = folder(b, "Tables", "Table");
+    let views_id = folder(b, "Views", "View");
+    let procs_id = folder(b, "Stored Procedures", "StoredProcedure");
+    let funcs_id = folder(b, "Functions", "UserDefinedFunction");
 
     for row in rows {
         let schema = row.get::<&str, _>(0).unwrap_or("dbo");
         let name = row.get::<&str, _>(1).unwrap_or("");
         let type_code = row.get::<&str, _>(2).unwrap_or("U").trim();
         let owner = row.get::<&str, _>(3).unwrap_or(schema);
+        let date = row.get::<&str, _>(4).unwrap_or("");
         let (kind, parent, type_urn) = match type_code {
             "U" => (ObjectKind::Table, tables_id, "Table"),
             "V" => (ObjectKind::View, views_id, "View"),
@@ -176,44 +264,41 @@ ORDER BY \
             "FN" | "IF" | "TF" => (ObjectKind::Function, funcs_id, "UserDefinedFunction"),
             _ => continue,
         };
-        let schema_esc = escape_urn(schema);
-        let name_esc = escape_urn(name);
         let object_urn = format!(
-            "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/{type_urn}[@Name='{name_esc}' and @Schema='{schema_esc}']"
+            "{db_urn}/{type_urn}[@Name='{}' and @Schema='{}']",
+            escape_urn(name),
+            escape_urn(schema)
         );
-        let object_id = add(Some(parent), kind, name, schema, owner, object_urn.clone());
+        let object_id = b.add(
+            Some(parent),
+            kind,
+            name,
+            schema,
+            owner,
+            object_urn.clone(),
+            date,
+        );
         if kind == ObjectKind::Table {
-            add(
-                Some(object_id),
-                ObjectKind::Folder,
-                "Columns",
-                "",
-                "",
-                table_child_folder_urn(&object_urn, "Columns"),
-            );
-            add(
-                Some(object_id),
-                ObjectKind::Folder,
-                "Indexes",
-                "",
-                "",
-                table_child_folder_urn(&object_urn, "Indexes"),
-            );
+            for child in ["Columns", "Indexes"] {
+                b.add(
+                    Some(object_id),
+                    ObjectKind::Folder,
+                    child,
+                    "",
+                    "",
+                    table_child_folder_urn(&object_urn, child),
+                    "",
+                );
+            }
         }
     }
 
-    let synonyms_id = add(
-        Some(db_id),
-        ObjectKind::Folder,
-        "Synonyms",
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Synonym"),
-    );
+    let synonyms_id = folder(b, "Synonyms", "Synonym");
     let syn_stream = client
         .query(
             "SELECT s.name AS schema_name, syn.name AS object_name, \
-             ISNULL(USER_NAME(syn.principal_id), s.name) AS owner_name \
+             ISNULL(USER_NAME(syn.principal_id), s.name) AS owner_name, \
+             CONVERT(varchar(33), syn.create_date, 126) AS create_date \
              FROM sys.synonyms AS syn \
              INNER JOIN sys.schemas AS s ON syn.schema_id = s.schema_id \
              ORDER BY s.name, syn.name",
@@ -224,32 +309,28 @@ ORDER BY \
         let schema = row.get::<&str, _>(0).unwrap_or("dbo");
         let name = row.get::<&str, _>(1).unwrap_or("");
         let owner = row.get::<&str, _>(2).unwrap_or(schema);
-        let schema_esc = escape_urn(schema);
-        let name_esc = escape_urn(name);
-        add(
+        let date = row.get::<&str, _>(3).unwrap_or("");
+        b.add(
             Some(synonyms_id),
             ObjectKind::Synonym,
             name,
             schema,
             owner,
             format!(
-                "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Synonym[@Name='{name_esc}' and @Schema='{schema_esc}']"
+                "{db_urn}/Synonym[@Name='{}' and @Schema='{}']",
+                escape_urn(name),
+                escape_urn(schema)
             ),
+            date,
         );
     }
 
-    let triggers_id = add(
-        Some(db_id),
-        ObjectKind::Folder,
-        "Triggers",
-        "",
-        "",
-        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Trigger"),
-    );
+    let triggers_id = folder(b, "Triggers", "Trigger");
     let trig_stream = client
         .query(
             "SELECT sch.name AS schema_name, t.name AS object_name, \
-             ISNULL(USER_NAME(o.principal_id), sch.name) AS owner_name \
+             ISNULL(USER_NAME(o.principal_id), sch.name) AS owner_name, \
+             CONVERT(varchar(33), t.create_date, 126) AS create_date \
              FROM sys.triggers AS t \
              INNER JOIN sys.objects AS o ON t.object_id = o.object_id \
              INNER JOIN sys.schemas AS sch ON o.schema_id = sch.schema_id \
@@ -262,21 +343,22 @@ ORDER BY \
         let schema = row.get::<&str, _>(0).unwrap_or("dbo");
         let name = row.get::<&str, _>(1).unwrap_or("");
         let owner = row.get::<&str, _>(2).unwrap_or(schema);
-        let schema_esc = escape_urn(schema);
-        let name_esc = escape_urn(name);
-        add(
+        let date = row.get::<&str, _>(3).unwrap_or("");
+        b.add(
             Some(triggers_id),
             ObjectKind::Trigger,
             name,
             schema,
             owner,
             format!(
-                "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Trigger[@Name='{name_esc}' and @Schema='{schema_esc}']"
+                "{db_urn}/Trigger[@Name='{}' and @Schema='{}']",
+                escape_urn(name),
+                escape_urn(schema)
             ),
+            date,
         );
     }
-
-    Ok(Catalog { objects })
+    Ok(())
 }
 
 pub async fn describe_object(
@@ -347,6 +429,7 @@ pub async fn load_table_children(
             schema: schema.to_string(),
             owner: String::new(),
             urn: child_leaf_urn(&table_urn, leaf, name),
+            create_date: String::new(),
         });
         next += 1;
     };

@@ -50,15 +50,19 @@ pub struct CatalogObject {
     pub schema: String,
     pub owner: String,
     pub urn: String,
+    /// ISO-ish create date (empty when unknown).
+    #[serde(default)]
+    pub create_date: String,
 }
 
 impl CatalogObject {
-    pub fn props(&self) -> [(&str, &str); 4] {
+    pub fn props(&self) -> [(&str, &str); 5] {
         [
             ("Name", self.name.as_str()),
             ("Schema", self.schema.as_str()),
             ("Owner", self.owner.as_str()),
             ("Type", self.kind.as_str()),
+            ("Date", self.create_date.as_str()),
         ]
     }
 
@@ -94,6 +98,7 @@ impl Catalog {
                 schema: schema.to_string(),
                 owner: owner.to_string(),
                 urn,
+                create_date: String::new(),
             });
             id
         };
@@ -270,6 +275,9 @@ impl Catalog {
                 .into(),
         );
 
+        if let Some(o) = objects.iter_mut().find(|o| Some(o.id) == employee_id) {
+            o.create_date = "2009-01-14T10:02:11.230".into();
+        }
         Self { objects }
     }
 
@@ -471,6 +479,7 @@ mod tests {
             schema: "dbo".into(),
             owner: "sa".into(),
             urn: "x".into(),
+            create_date: "2024-01-02T03:04:05.000".into(),
         };
         assert_eq!(
             o.props(),
@@ -479,8 +488,20 @@ mod tests {
                 ("Schema", "dbo"),
                 ("Owner", "sa"),
                 ("Type", "Table"),
+                ("Date", "2024-01-02T03:04:05.000"),
             ]
         );
+    }
+
+    #[test]
+    fn demo_employee_has_date_and_filter_matches() {
+        let cat = Catalog::demo();
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("Date", FilterOperator::StartsWith, "2009")],
+        };
+        let hits = cat.search(&sc);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "Employee");
     }
 
     #[test]
@@ -533,6 +554,7 @@ mod tests {
             schema: "dbo".into(),
             owner: "dbo".into(),
             urn: "Server[@Name='x']".into(),
+            create_date: String::new(),
         };
         let json = serde_json::to_string(&o).unwrap();
         let back: CatalogObject = serde_json::from_str(&json).unwrap();
