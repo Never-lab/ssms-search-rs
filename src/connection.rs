@@ -2,9 +2,13 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use std::time::Duration;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+/// Cap hung TCP/TDS logins so the GUI can show an error and retry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub type SqlClient = Client<Compat<TcpStream>>;
 
@@ -29,6 +33,10 @@ pub struct ConnectArgs {
     /// SQL password (also MSSQL_PASSWORD)
     #[arg(long, short = 'P', env = "MSSQL_PASSWORD")]
     pub password: Option<String>,
+
+    /// Windows Integrated Auth / Trusted Connection (SSPI). Ignores -U/-P.
+    #[arg(long, env = "MSSQL_TRUSTED", default_value_t = false)]
+    pub trusted: bool,
 
     /// Trust server certificate (dev / self-signed)
     #[arg(long, env = "MSSQL_TRUST_CERT", default_value_t = true)]
@@ -55,17 +63,31 @@ impl ConnectArgs {
         // Prefer encryption when available; TrustCert covers lab boxes.
         config.encryption(EncryptionLevel::Required);
 
-        match (&self.user, &self.password) {
-            (Some(u), Some(p)) => {
-                config.authentication(AuthMethod::sql_server(u, p));
+        if self.trusted {
+            #[cfg(windows)]
+            {
+                config.authentication(AuthMethod::Integrated);
             }
-            (None, None) => {
+            #[cfg(not(windows))]
+            {
                 bail!(
-                    "SQL auth required: set --user/--password or MSSQL_USER/MSSQL_PASSWORD \
-                     (Windows Integrated Auth not wired yet on this toolchain)"
+                    "Windows Integrated Auth (--trusted) is only available on Windows \
+                     (enable tiberius winauth / SSPI)"
                 );
             }
-            _ => bail!("both --user and --password are required for SQL authentication"),
+        } else {
+            match (&self.user, &self.password) {
+                (Some(u), Some(p)) => {
+                    config.authentication(AuthMethod::sql_server(u, p));
+                }
+                (None, None) => {
+                    bail!(
+                        "SQL auth required: set --user/--password (or MSSQL_USER/MSSQL_PASSWORD), \
+                         or use --trusted for Windows Integrated Auth"
+                    );
+                }
+                _ => bail!("both --user and --password are required for SQL authentication"),
+            }
         }
 
         Ok(config)
@@ -98,14 +120,23 @@ pub async fn connect(args: &ConnectArgs) -> Result<SqlClient> {
         format!("{host}:{port} db={}", args.database),
         async {
             let config = args.to_config()?;
-            let tcp = TcpStream::connect(format!("{host}:{port}"))
-                .await
-                .with_context(|| format!("TCP connect failed to {host}:{port}"))?;
-            tcp.set_nodelay(true)?;
-            let client = Client::connect(config, tcp.compat_write())
-                .await
-                .context("TDS login failed")?;
-            Ok(client)
+            let host = host.clone();
+            let fut = async {
+                let tcp = TcpStream::connect(format!("{host}:{port}"))
+                    .await
+                    .with_context(|| format!("TCP connect failed to {host}:{port}"))?;
+                tcp.set_nodelay(true)?;
+                Client::connect(config, tcp.compat_write())
+                    .await
+                    .context("TDS login failed")
+            };
+            match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
+                Ok(r) => r,
+                Err(_) => bail!(
+                    "connection timed out after {}s to {host}:{port}",
+                    CONNECT_TIMEOUT.as_secs()
+                ),
+            }
         },
     )
     .await
@@ -128,6 +159,29 @@ pub async fn ping(client: &mut SqlClient) -> Result<(String, String, String)> {
     .await
 }
 
+/// Heuristic: error chain looks like a dead TDS/TCP session (safe to reconnect once).
+pub fn is_connection_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        let s = cause.to_string().to_ascii_lowercase();
+        if s.contains("connection")
+            || s.contains("broken pipe")
+            || s.contains("connection reset")
+            || s.contains("timed out")
+            || s.contains("timeout")
+            || s.contains("network")
+            || s.contains("eof")
+            || s.contains("closed")
+            || s.contains("transport")
+            || s.contains("os error 10054")
+            || s.contains("os error 10053")
+            || s.contains("not connected")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +193,7 @@ mod tests {
             database: "master".into(),
             user: user.map(str::to_string),
             password: password.map(str::to_string),
+            trusted: false,
             trust_cert: true,
             app_name: "ssms-search-rs-test".into(),
         }
@@ -215,5 +270,27 @@ mod tests {
     fn to_config_accepts_sql_auth() {
         let ok = args("sql.lab,14333", 1433, Some("sa"), Some("secret"));
         assert!(ok.to_config().is_ok());
+    }
+
+    #[test]
+    fn to_config_accepts_trusted_without_user() {
+        let mut a = args("localhost", 1433, None, None);
+        a.trusted = true;
+        #[cfg(windows)]
+        assert!(a.to_config().is_ok());
+        #[cfg(not(windows))]
+        assert!(a.to_config().is_err());
+    }
+
+    #[test]
+    fn is_connection_error_detects_reset() {
+        let e = anyhow::anyhow!("TCP connection reset by peer");
+        assert!(is_connection_error(&e));
+    }
+
+    #[test]
+    fn is_connection_error_ignores_sql_syntax() {
+        let e = anyhow::anyhow!("Incorrect syntax near 'SELEC'");
+        assert!(!is_connection_error(&e));
     }
 }

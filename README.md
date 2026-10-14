@@ -2,7 +2,7 @@
 
 Desktop **Object Explorer** inspired by SSMS, built with **egui/eframe** (finestra nativa Windows) + toolkit SQL Server in Rust.
 
-**Status:** `0.6.0-alpha.1` — first public alpha Windows build.
+**Status:** `0.7.0-alpha.1` — Windows alpha (session worker, Windows Auth, multi-row filter).
 
 Evidence SSMS 22: [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
@@ -46,9 +46,10 @@ Avvio GUI (default):
 ## CLI (headless, opzionale)
 
 ```powershell
-.\release\ssms-search-rs.exe connect -U sa -P '...' 
+.\release\ssms-search-rs.exe connect --trusted
+.\release\ssms-search-rs.exe connect -U sa -P '...'
 .\release\ssms-search-rs.exe search --demo -c Name -o Contains -v User
-.\release\ssms-search-rs.exe query -U sa -P '...' -d MyDb "SELECT TOP 5 name FROM sys.tables"
+.\release\ssms-search-rs.exe query --trusted -d MyDb "SELECT TOP 5 name FROM sys.tables"
 ```
 
 ## CI / Release (GitHub Actions)
@@ -61,11 +62,11 @@ Avvio GUI (default):
 ```powershell
 cargo test --lib
 # release da tag:
-git tag v0.5.1
-git push origin v0.5.1
+git tag v0.7.0-alpha.1
+git push origin v0.7.0-alpha.1
 ```
 
 ## Build notes
 
 - Toolchain: `stable-x86_64-pc-windows-gnu` + `D:\mingw64`
-- SQL auth via `-U`/`-P` o dialog GUI; Integrated Auth non ancora
+- SQL auth via `-U`/`-P` o dialog GUI; Windows Integrated Auth via `--trusted` / toggle **Windows Auth** in Connect

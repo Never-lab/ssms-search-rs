@@ -1,12 +1,12 @@
 //! Desktop UI (egui) — SSMS-inspired Object Explorer + Query / Execution Plan.
 
-use anyhow::Context;
+use crate::sql_worker::{SqlCommand, SqlResponse, SqlWorkerHandle};
 use eframe::egui::{
     self, Color32, CornerRadius, Frame, Key, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
-use ssms_search_rs::connection::{connect, ping, ConnectArgs};
+use ssms_search_rs::connection::ConnectArgs;
 use ssms_search_rs::filter::{FilterItem, FilterOperator, SearchConditions};
-use ssms_search_rs::functions::{self, ColumnInfo, PlanMode, QueryExecution, QueryResult};
+use ssms_search_rs::functions::{ColumnInfo, PlanMode, QueryExecution, QueryResult};
 use ssms_search_rs::plan::PlanOperator;
 use ssms_search_rs::plan_children;
 use ssms_search_rs::{Catalog, CatalogObject, ObjectKind};
@@ -57,12 +57,15 @@ pub struct SsmsApp {
     workspace: Workspace,
     explorer_tab: ExplorerTab,
     conditions: SearchConditions,
-    filter_draft: FilterItem,
+    /// Editable copy of filter rows while the Filter Settings dialog is open.
+    filter_draft: Vec<FilterItem>,
     show_filter: bool,
     show_connect: bool,
     conn_server: String,
     conn_port: String,
     conn_database: String,
+    /// Windows Integrated Auth (Trusted Connection) vs SQL login.
+    conn_windows_auth: bool,
     conn_user: String,
     conn_password: String,
     connection_label: String,
@@ -70,6 +73,12 @@ pub struct SsmsApp {
     connected: bool,
     /// Args of the live session; every post-connect SQL job uses these, not the form.
     session_args: Option<ConnectArgs>,
+    /// Persistent TDS worker (one client, off UI thread).
+    worker: SqlWorkerHandle,
+    /// True while a SQL command is in flight.
+    sql_pending: bool,
+    /// ConnectArgs for the in-flight Connect (applied on success).
+    inflight_connect_args: Option<ConnectArgs>,
     status: String,
     status_error: bool,
     object_hits: Vec<u64>,
@@ -101,18 +110,22 @@ impl SsmsApp {
             workspace: Workspace::Explorer,
             explorer_tab: ExplorerTab::ObjectExplorerDetails,
             conditions: SearchConditions::default(),
-            filter_draft: FilterItem::new("Name", FilterOperator::Contains, ""),
+            filter_draft: Vec::new(),
             show_filter: false,
             show_connect: true,
             conn_server: "localhost".into(),
             conn_port: "1433".into(),
             conn_database: "master".into(),
+            conn_windows_auth: true,
             conn_user: String::new(),
             conn_password: String::new(),
             connection_label: "Demo catalog".into(),
             is_demo: true,
             connected: false,
             session_args: None,
+            worker: SqlWorkerHandle::spawn(),
+            sql_pending: false,
+            inflight_connect_args: None,
             status: "Ready — connect or use demo, then New Query".into(),
             status_error: false,
             object_hits: Vec::new(),
@@ -134,14 +147,28 @@ impl SsmsApp {
 
     fn connect_args(&self) -> ConnectArgs {
         let port: u16 = self.conn_port.parse().unwrap_or(1433);
-        ConnectArgs {
-            server: self.conn_server.clone(),
-            port,
-            database: self.conn_database.clone(),
-            user: Some(self.conn_user.clone()).filter(|s| !s.is_empty()),
-            password: Some(self.conn_password.clone()),
-            trust_cert: true,
-            app_name: "ssms-search-rs".into(),
+        if self.conn_windows_auth {
+            ConnectArgs {
+                server: self.conn_server.clone(),
+                port,
+                database: self.conn_database.clone(),
+                user: None,
+                password: None,
+                trusted: true,
+                trust_cert: true,
+                app_name: "ssms-search-rs".into(),
+            }
+        } else {
+            ConnectArgs {
+                server: self.conn_server.clone(),
+                port,
+                database: self.conn_database.clone(),
+                user: Some(self.conn_user.clone()).filter(|s| !s.is_empty()),
+                password: Some(self.conn_password.clone()),
+                trusted: false,
+                trust_cert: true,
+                app_name: "ssms-search-rs".into(),
+            }
         }
     }
 
@@ -173,8 +200,22 @@ impl SsmsApp {
         }
     }
 
+    fn open_filter(&mut self) {
+        self.filter_draft = if self.conditions.items.is_empty() {
+            vec![FilterItem::new("Name", FilterOperator::Contains, "")]
+        } else {
+            self.conditions.items.clone()
+        };
+        self.show_filter = true;
+    }
+
     fn apply_filter(&mut self) {
-        self.conditions.items = vec![self.filter_draft.clone()];
+        self.conditions.items = self
+            .filter_draft
+            .iter()
+            .filter(|i| !i.value.is_empty() || !i.value2.is_empty())
+            .cloned()
+            .collect();
         self.show_filter = false;
         self.workspace = Workspace::Explorer;
         self.explorer_tab = ExplorerTab::ObjectExplorerDetails;
@@ -184,10 +225,35 @@ impl SsmsApp {
 
     fn clear_filter(&mut self) {
         self.conditions.clear();
-        self.filter_draft.value.clear();
+        self.filter_draft.clear();
         self.status_error = false;
         self.refresh_object_hits();
         self.status = "Filter cleared".into();
+    }
+
+    fn filter_summary(conditions: &SearchConditions) -> String {
+        if conditions.is_empty() {
+            return "No filter".into();
+        }
+        conditions
+            .items
+            .iter()
+            .filter(|i| !i.value.is_empty() || !i.value2.is_empty())
+            .map(|i| {
+                if matches!(
+                    i.operator,
+                    FilterOperator::Between | FilterOperator::NotBetween
+                ) {
+                    format!(
+                        "{} {} '{}'..'{}'",
+                        i.column, i.operator, i.value, i.value2
+                    )
+                } else {
+                    format!("{} {} '{}'", i.column, i.operator, i.value)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
     }
 
     fn new_query(&mut self) {
@@ -202,6 +268,9 @@ impl SsmsApp {
     }
 
     fn load_demo(&mut self) {
+        let _ = self.worker.submit(SqlCommand::Disconnect);
+        self.sql_pending = false;
+        self.inflight_connect_args = None;
         self.catalog = Catalog::demo();
         self.expanded.clear();
         self.loaded_folders.clear();
@@ -221,31 +290,162 @@ impl SsmsApp {
         self.refresh_object_hits();
     }
 
-    /// Run async SQL work on a dedicated OS thread + owned Tokio runtime.
-    /// Avoids "Cannot start a runtime from within a runtime" panics that close the window.
-    fn sql_job<T, F>(&self, job: F) -> Result<T, String>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> anyhow::Result<T> + Send + 'static,
-    {
-        let handle = std::thread::Builder::new()
-            .name("ssms-sql".into())
-            .spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)))
-            .map_err(|e| format!("spawn sql thread: {e}"))?;
-        match handle
-            .join()
-            .map_err(|_| "SQL worker thread join failed".to_string())?
+    fn submit_sql(&mut self, cmd: SqlCommand) -> bool {
+        if self.sql_pending {
+            self.status_error = false;
+            self.status = "Busy…".into();
+            return false;
+        }
+        if let Err(e) = self.worker.submit(cmd) {
+            self.status_error = true;
+            self.status = e;
+            return false;
+        }
+        self.sql_pending = true;
+        true
+    }
+
+    fn poll_sql(&mut self, ctx: &egui::Context) {
+        while let Some(resp) = self.worker.try_recv() {
+            self.sql_pending = false;
+            self.apply_sql_response(resp);
+        }
+        if self.sql_pending {
+            ctx.request_repaint();
+        }
+    }
+
+    fn apply_sql_response(&mut self, resp: SqlResponse) {
+        // After Load Demo, ignore stale Expand/Execute/etc. from a prior live session.
+        // Never drop Connect — initial UI state is demo+disconnected until first login.
+        if self.is_demo
+            && !self.connected
+            && !matches!(
+                resp,
+                SqlResponse::Connect { .. } | SqlResponse::Disconnected
+            )
         {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(format!("{e:#}")),
-            Err(panic) => {
-                let msg = panic
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                Err(format!("SQL worker panicked: {msg}"))
-            }
+            return;
+        }
+        match resp {
+            SqlResponse::Disconnected => {}
+            SqlResponse::Connect { refresh, result } => match result {
+                Ok((catalog, server, db, login)) => {
+                    if let Some(args) = self.inflight_connect_args.take() {
+                        self.session_args = Some(args);
+                    }
+                    self.catalog = catalog;
+                    self.expanded.clear();
+                    self.loaded_folders.clear();
+                    self.loaded_databases.clear();
+                    self.described = None;
+                    if let Some(root) = self.catalog.children(None).first() {
+                        self.expanded.insert(root.id);
+                        let preloaded: Vec<u64> = self
+                            .catalog
+                            .children(Some(root.id))
+                            .into_iter()
+                            .filter(|d| !self.catalog.children(Some(d.id)).is_empty())
+                            .map(|d| d.id)
+                            .collect();
+                        self.expanded.extend(&preloaded);
+                        self.loaded_databases.extend(preloaded);
+                    }
+                    self.selected_id = None;
+                    self.is_demo = false;
+                    self.connected = true;
+                    self.connection_label = format!("{server} · {db} · {login}");
+                    self.status_error = false;
+                    self.status = if refresh { "Refreshed" } else { "Connected" }.into();
+                    self.show_connect = false;
+                    self.refresh_object_hits();
+                }
+                Err(e) => {
+                    self.inflight_connect_args = None;
+                    self.connected = refresh && self.connected;
+                    self.status_error = true;
+                    self.status = format!(
+                        "{} failed: {e}",
+                        if refresh { "Refresh" } else { "Connect" }
+                    );
+                    if !refresh {
+                        self.show_connect = true;
+                    }
+                }
+            },
+            SqlResponse::ExpandDatabase { db_id, result } => match result {
+                Ok((catalog, database)) => {
+                    self.catalog = catalog;
+                    self.loaded_databases.insert(db_id);
+                    self.status_error = false;
+                    self.status = format!("Loaded database {database}");
+                    self.refresh_object_hits();
+                }
+                Err(e) => {
+                    self.status_error = true;
+                    self.status = format!("Load database failed: {e}");
+                }
+            },
+            SqlResponse::LoadTableChildren {
+                cols_id,
+                idx_id,
+                result,
+            } => match result {
+                Ok(new) => {
+                    self.status_error = false;
+                    self.status = format!("Loaded {} column/index item(s)", new.len());
+                    self.catalog.objects.extend(new);
+                    self.loaded_folders.insert(cols_id);
+                    self.loaded_folders.insert(idx_id);
+                    self.refresh_object_hits();
+                }
+                Err(e) => {
+                    self.status_error = true;
+                    self.status = format!("Load table children failed: {e}");
+                }
+            },
+            SqlResponse::Describe {
+                object_id,
+                schema,
+                name,
+                result,
+            } => match result {
+                Ok(cols) => {
+                    self.status_error = false;
+                    self.status = format!("{} column(s) for {schema}.{name}", cols.len());
+                    self.described = Some((object_id, cols));
+                }
+                Err(e) => {
+                    self.status_error = true;
+                    self.status = format!("Describe failed: {e}");
+                }
+            },
+            SqlResponse::Script {
+                schema,
+                name,
+                result,
+            } => match result {
+                Ok(sql) => {
+                    self.sql_text = sql;
+                    self.new_query();
+                    self.status_error = false;
+                    self.status = format!("Scripted {schema}.{name}");
+                }
+                Err(e) => {
+                    self.status_error = true;
+                    self.status = format!("Script failed: {e}");
+                }
+            },
+            SqlResponse::Execute { result } => match result {
+                Ok(exec) => self.apply_execution(exec),
+                Err(e) => {
+                    self.status_error = true;
+                    self.status = format!("Execute failed: {e}");
+                    self.query_messages = vec![format!("Error: {e}")];
+                    self.query_bottom = QueryBottomTab::Messages;
+                    self.workspace = Workspace::Query;
+                }
+            },
         }
     }
 
@@ -255,7 +455,6 @@ impl SsmsApp {
             (true, Some(a)) => a,
             _ => self.connect_args(),
         };
-        let session = args.clone();
         self.status_error = false;
         self.status = if refresh {
             "Refreshing…"
@@ -263,59 +462,9 @@ impl SsmsApp {
             "Connecting…"
         }
         .into();
-
-        let result = self.sql_job(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("tokio")?;
-            rt.block_on(async {
-                let mut client = connect(&args).await?;
-                let (server, db, login) = ping(&mut client).await?;
-                let catalog =
-                    functions::load_server_catalog(&mut client, &server, &args.database).await?;
-                Ok::<_, anyhow::Error>((catalog, server, db, login))
-            })
-        });
-
-        match result {
-            Ok((catalog, server, db, login)) => {
-                self.catalog = catalog;
-                self.expanded.clear();
-                self.loaded_folders.clear();
-                self.loaded_databases.clear();
-                self.described = None;
-                if let Some(root) = self.catalog.children(None).first() {
-                    self.expanded.insert(root.id);
-                    // The preferred database arrives fully populated: expand it.
-                    let preloaded: Vec<u64> = self
-                        .catalog
-                        .children(Some(root.id))
-                        .into_iter()
-                        .filter(|d| !self.catalog.children(Some(d.id)).is_empty())
-                        .map(|d| d.id)
-                        .collect();
-                    self.expanded.extend(&preloaded);
-                    self.loaded_databases.extend(preloaded);
-                }
-                self.selected_id = None;
-                self.is_demo = false;
-                self.connected = true;
-                self.session_args = Some(session);
-                self.connection_label = format!("{server} · {db} · {login}");
-                self.status_error = false;
-                self.status = if refresh { "Refreshed" } else { "Connected" }.into();
-                self.show_connect = false;
-                self.refresh_object_hits();
-            }
-            Err(e) => {
-                self.connected = refresh && self.connected;
-                self.status_error = true;
-                self.status = format!(
-                    "{} failed: {e}",
-                    if refresh { "Refresh" } else { "Connect" }
-                );
-            }
+        self.inflight_connect_args = Some(args.clone());
+        if !self.submit_sql(SqlCommand::Connect { args, refresh }) {
+            self.inflight_connect_args = None;
         }
     }
 
@@ -326,34 +475,13 @@ impl SsmsApp {
             self.show_connect = true;
             return;
         }
-        let sql = self.sql_text.clone();
-        let Some(args) = self.session_args.clone() else {
+        if self.session_args.is_none() {
             return;
-        };
+        }
+        let sql = self.sql_text.clone();
         self.status = "Executing…".into();
         self.status_error = false;
-
-        let result = self.sql_job(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("tokio")?;
-            rt.block_on(async {
-                let mut client = connect(&args).await?;
-                functions::run_query_ex(&mut client, &sql, 500, mode).await
-            })
-        });
-
-        match result {
-            Ok(exec) => self.apply_execution(exec),
-            Err(e) => {
-                self.status_error = true;
-                self.status = format!("Execute failed: {e}");
-                self.query_messages = vec![format!("Error: {e}")];
-                self.query_bottom = QueryBottomTab::Messages;
-                self.workspace = Workspace::Query;
-            }
-        }
+        self.submit_sql(SqlCommand::Execute { sql, mode });
     }
 
     fn apply_execution(&mut self, exec: QueryExecution) {
@@ -471,7 +599,7 @@ impl SsmsApp {
                     ui.close_menu();
                 }
                 if ui.button("Filter Settings…").clicked() {
-                    self.show_filter = true;
+                    self.open_filter();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -491,7 +619,7 @@ impl SsmsApp {
                 }
             });
             ui.menu_button("Help", |ui| {
-                ui.label("ssms-search-rs 0.5 — Query + Execution Plan");
+                ui.label("ssms-search-rs 0.7.0-alpha.1 — Query + Execution Plan");
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -557,7 +685,7 @@ impl SsmsApp {
                 ))
                 .clicked()
             {
-                self.show_filter = true;
+                self.open_filter();
             }
             if ui.button("Object Explorer").clicked() {
                 self.workspace = Workspace::Explorer;
@@ -611,7 +739,8 @@ impl SsmsApp {
 
     /// Populate a live Database node the first time it is expanded.
     fn load_database_children(&mut self, db_id: u64) {
-        if self.is_demo || !self.connected || self.loaded_databases.contains(&db_id) {
+        if self.is_demo || !self.connected || self.sql_pending || self.loaded_databases.contains(&db_id)
+        {
             return;
         }
         let Some(db) = self
@@ -629,44 +758,18 @@ impl SsmsApp {
             self.loaded_databases.insert(db_id);
             return;
         }
-        let Some(args) = self.session_args.clone() else {
+        if self.session_args.is_none() {
             return;
-        };
-        let mut catalog = self.catalog.clone();
+        }
+        let catalog = self.catalog.clone();
         self.status_error = false;
         self.status = format!("Loading database {database}…");
-
-        let result = self.sql_job(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("tokio")?;
-            rt.block_on(async {
-                let mut client = connect(&args).await?;
-                functions::ensure_database_loaded(
-                    &mut client,
-                    &server,
-                    &database,
-                    &mut catalog,
-                    db_id,
-                )
-                .await?;
-                Ok::<_, anyhow::Error>((catalog, database))
-            })
+        self.submit_sql(SqlCommand::ExpandDatabase {
+            db_id,
+            database,
+            server,
+            catalog,
         });
-
-        match result {
-            Ok((catalog, database)) => {
-                self.catalog = catalog;
-                self.loaded_databases.insert(db_id);
-                self.status = format!("Loaded database {database}");
-                self.refresh_object_hits();
-            }
-            Err(e) => {
-                self.status_error = true;
-                self.status = format!("Load database failed: {e}");
-            }
-        }
     }
 
     /// Properties → "Describe columns…" (Table/View).
@@ -677,32 +780,18 @@ impl SsmsApp {
         let Some(database) = self.catalog.database_name_of(o.id).map(str::to_string) else {
             return;
         };
-        let Some(args) = self.session_args.clone() else {
+        if self.session_args.is_none() {
             return;
-        };
+        }
         let (schema, name) = (o.schema.clone(), o.name.clone());
         self.status_error = false;
         self.status = format!("Describing {schema}.{name}…");
-        let result = self.sql_job(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("tokio")?;
-            rt.block_on(async {
-                let mut client = connect(&args).await?;
-                functions::describe_object(&mut client, &database, &schema, &name).await
-            })
+        self.submit_sql(SqlCommand::Describe {
+            object_id: o.id,
+            database,
+            schema,
+            name,
         });
-        match result {
-            Ok(cols) => {
-                self.status = format!("{} column(s) for {}.{}", cols.len(), o.schema, o.name);
-                self.described = Some((o.id, cols));
-            }
-            Err(e) => {
-                self.status_error = true;
-                self.status = format!("Describe failed: {e}");
-            }
-        }
     }
 
     /// Properties → "Script definition…" (Procedure/Function/View/Trigger) into the query editor.
@@ -713,38 +802,26 @@ impl SsmsApp {
         let Some(database) = self.catalog.database_name_of(o.id).map(str::to_string) else {
             return;
         };
-        let Some(args) = self.session_args.clone() else {
+        if self.session_args.is_none() {
             return;
-        };
+        }
         let (schema, name) = (o.schema.clone(), o.name.clone());
         self.status_error = false;
         self.status = format!("Scripting {schema}.{name}…");
-        let result = self.sql_job(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("tokio")?;
-            rt.block_on(async {
-                let mut client = connect(&args).await?;
-                functions::object_definition(&mut client, &database, &schema, &name).await
-            })
+        self.submit_sql(SqlCommand::Script {
+            database,
+            schema,
+            name,
         });
-        match result {
-            Ok(sql) => {
-                self.sql_text = sql;
-                self.new_query();
-                self.status = format!("Scripted {}.{}", o.schema, o.name);
-            }
-            Err(e) => {
-                self.status_error = true;
-                self.status = format!("Script failed: {e}");
-            }
-        }
     }
 
     /// Lazy-load Columns/Indexes for a live table when its folder is first opened.
     fn load_folder_children(&mut self, folder_id: u64) {
-        if self.is_demo || !self.connected || self.loaded_folders.contains(&folder_id) {
+        if self.is_demo
+            || !self.connected
+            || self.sql_pending
+            || self.loaded_folders.contains(&folder_id)
+        {
             return;
         }
         let Some(folder) = self.catalog.by_id(folder_id) else {
@@ -790,46 +867,20 @@ impl SsmsApp {
         };
         let (schema, table_name) = (table.schema.clone(), table.name.clone());
         let start_id = self.catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
-        let Some(args) = self.session_args.clone() else {
+        if self.session_args.is_none() {
             return;
-        };
+        }
         self.status_error = false;
         self.status = format!("Loading {schema}.{table_name} columns and indexes…");
-
-        let result = self.sql_job(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("tokio")?;
-            rt.block_on(async {
-                let mut client = connect(&args).await?;
-                functions::load_table_children(
-                    &mut client,
-                    &database,
-                    &server,
-                    &schema,
-                    &table_name,
-                    cols_id,
-                    idx_id,
-                    start_id,
-                )
-                .await
-            })
+        self.submit_sql(SqlCommand::LoadTableChildren {
+            database,
+            server,
+            schema,
+            table_name,
+            cols_id,
+            idx_id,
+            start_id,
         });
-
-        match result {
-            Ok(new) => {
-                self.status = format!("Loaded {} column/index item(s)", new.len());
-                self.catalog.objects.extend(new);
-                self.loaded_folders.insert(cols_id);
-                self.loaded_folders.insert(idx_id);
-                self.refresh_object_hits();
-            }
-            Err(e) => {
-                self.status_error = true;
-                self.status = format!("Load table children failed: {e}");
-            }
-        }
     }
 
     fn draw_tree_node(&mut self, ui: &mut egui::Ui, id: u64, depth: usize) {
@@ -948,14 +999,7 @@ impl SsmsApp {
     }
 
     fn draw_object_hits(&mut self, ui: &mut egui::Ui) {
-        let filter = if self.conditions.is_empty() {
-            "No filter".to_string()
-        } else {
-            format!(
-                "{} {} '{}'",
-                self.filter_draft.column, self.filter_draft.operator, self.filter_draft.value
-            )
-        };
+        let filter = Self::filter_summary(&self.conditions);
         ui.label(
             RichText::new(format!(
                 "Results ({})  ·  Filter: {}",
@@ -1315,10 +1359,26 @@ impl SsmsApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("SQL Server Authentication")
+                    RichText::new("Connect to Server")
                         .color(ssms_colors::TITLE)
                         .strong(),
                 );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Authentication:");
+                    if ui
+                        .selectable_label(self.conn_windows_auth, "Windows Auth")
+                        .clicked()
+                    {
+                        self.conn_windows_auth = true;
+                    }
+                    if ui
+                        .selectable_label(!self.conn_windows_auth, "SQL Server Auth")
+                        .clicked()
+                    {
+                        self.conn_windows_auth = false;
+                    }
+                });
                 ui.add_space(6.0);
                 egui::Grid::new("conn_grid")
                     .num_columns(2)
@@ -1338,25 +1398,51 @@ impl SsmsApp {
                                 .desired_width(220.0),
                         );
                         ui.end_row();
-                        ui.label("Login:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.conn_user).desired_width(220.0),
-                        );
-                        ui.end_row();
-                        ui.label("Password:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.conn_password)
-                                .password(true)
-                                .desired_width(220.0),
-                        );
-                        ui.end_row();
+                        if !self.conn_windows_auth {
+                            ui.label("Login:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.conn_user)
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                            ui.label("Password:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.conn_password)
+                                    .password(true)
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                        } else {
+                            ui.label("Login:");
+                            ui.label(
+                                RichText::new("Current Windows user")
+                                    .color(ssms_colors::MUTED)
+                                    .italics(),
+                            );
+                            ui.end_row();
+                        }
                     });
                 ui.add_space(10.0);
+                if self.sql_pending {
+                    ui.label(
+                        RichText::new("Connecting…")
+                            .color(ssms_colors::MUTED)
+                            .italics(),
+                    );
+                }
                 ui.horizontal(|ui| {
+                    let connect_label = if self.sql_pending {
+                        "Connecting…"
+                    } else {
+                        "Connect"
+                    };
                     if ui
-                        .add(
-                            egui::Button::new(RichText::new("Connect").color(Color32::WHITE))
-                                .fill(ssms_colors::ACCENT),
+                        .add_enabled(
+                            !self.sql_pending,
+                            egui::Button::new(
+                                RichText::new(connect_label).color(Color32::WHITE),
+                            )
+                            .fill(ssms_colors::ACCENT),
                         )
                         .clicked()
                     {
@@ -1365,7 +1451,10 @@ impl SsmsApp {
                     if ui.button("Cancel").clicked() {
                         self.show_connect = false;
                     }
-                    if ui.button("Use Demo").clicked() {
+                    if ui
+                        .add_enabled(!self.sql_pending, egui::Button::new("Use Demo"))
+                        .clicked()
+                    {
                         self.load_demo();
                     }
                 });
@@ -1375,51 +1464,90 @@ impl SsmsApp {
     fn draw_filter_modal(&mut self, ctx: &egui::Context) {
         egui::Window::new("Filter Settings")
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_width(560.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Filter the list of objects shown under the selected node.")
+                    RichText::new("Filter the list of objects shown under the selected node (AND).")
                         .color(ssms_colors::MUTED),
                 );
                 ui.add_space(8.0);
+                let mut remove_at: Option<usize> = None;
                 egui::Grid::new("filter_grid")
-                    .num_columns(3)
+                    .num_columns(5)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         ui.strong("Property");
                         ui.strong("Operator");
                         ui.strong("Value");
+                        ui.strong("Value 2");
+                        ui.strong("");
                         ui.end_row();
-                        egui::ComboBox::from_id_salt("filter_col")
-                            .selected_text(&self.filter_draft.column)
-                            .show_ui(ui, |ui| {
-                                for c in ["Name", "Schema", "Owner", "Type", "Date"] {
-                                    ui.selectable_value(
-                                        &mut self.filter_draft.column,
-                                        c.to_string(),
-                                        c,
-                                    );
-                                }
-                            });
-                        let op_label = self.filter_draft.operator.as_str().to_string();
-                        egui::ComboBox::from_id_salt("filter_op")
-                            .selected_text(op_label)
-                            .show_ui(ui, |ui| {
-                                for op in FilterOperator::ALL {
-                                    ui.selectable_value(
-                                        &mut self.filter_draft.operator,
-                                        op,
-                                        op.as_str(),
-                                    );
-                                }
-                            });
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.filter_draft.value)
-                                .desired_width(180.0),
-                        );
-                        ui.end_row();
+                        for i in 0..self.filter_draft.len() {
+                            let needs_v2 = matches!(
+                                self.filter_draft[i].operator,
+                                FilterOperator::Between | FilterOperator::NotBetween
+                            );
+                            egui::ComboBox::from_id_salt(("filter_col", i))
+                                .selected_text(&self.filter_draft[i].column)
+                                .show_ui(ui, |ui| {
+                                    for c in ["Name", "Schema", "Owner", "Type", "Date"] {
+                                        ui.selectable_value(
+                                            &mut self.filter_draft[i].column,
+                                            c.to_string(),
+                                            c,
+                                        );
+                                    }
+                                });
+                            let op_label = self.filter_draft[i].operator.as_str().to_string();
+                            egui::ComboBox::from_id_salt(("filter_op", i))
+                                .selected_text(op_label)
+                                .show_ui(ui, |ui| {
+                                    for op in FilterOperator::ALL {
+                                        ui.selectable_value(
+                                            &mut self.filter_draft[i].operator,
+                                            op,
+                                            op.as_str(),
+                                        );
+                                    }
+                                });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.filter_draft[i].value)
+                                    .desired_width(120.0),
+                            );
+                            if needs_v2 {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.filter_draft[i].value2)
+                                        .desired_width(120.0),
+                                );
+                            } else {
+                                self.filter_draft[i].value2.clear();
+                                ui.label(RichText::new("—").color(ssms_colors::MUTED));
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.filter_draft.len() > 1,
+                                    egui::Button::new("Remove"),
+                                )
+                                .clicked()
+                            {
+                                remove_at = Some(i);
+                            }
+                            ui.end_row();
+                        }
                     });
+                if let Some(i) = remove_at {
+                    self.filter_draft.remove(i);
+                }
+                ui.add_space(8.0);
+                if ui.button("Add").clicked() {
+                    self.filter_draft.push(FilterItem::new(
+                        "Name",
+                        FilterOperator::Contains,
+                        "",
+                    ));
+                }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -1446,6 +1574,7 @@ impl SsmsApp {
 impl eframe::App for SsmsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         Self::apply_visuals(ctx);
+        self.poll_sql(ctx);
 
         // F5 = Execute (SSMS)
         if ctx.input(|i| i.key_pressed(Key::F5)) {

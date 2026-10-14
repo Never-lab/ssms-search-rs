@@ -1,6 +1,7 @@
 //! Binary entry: desktop GUI by default; CLI subcommands for headless ops.
 
 mod gui;
+mod sql_worker;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};

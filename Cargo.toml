@@ -1,6 +1,6 @@
 [package]
 name = "ssms-search-rs"
-version = "0.6.0-alpha.1"
+version = "0.7.0-alpha.1"
 edition = "2021"
 description = "SSMS-inspired Object Explorer + Query + Execution Plan (egui) — alpha"
 license = "MIT"
@@ -23,6 +23,6 @@ egui = "0.31"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tiberius = { version = "0.12", default-features = false, features = ["chrono", "native-tls", "tds73"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "native-tls", "tds73", "winauth"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
