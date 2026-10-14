@@ -630,29 +630,38 @@ fn escape_urn(s: &str) -> String {
 }
 
 fn cell_to_string(row: &tiberius::Row, index: usize) -> String {
-    // Try common TDS types; fall back to Debug-ish empty.
-    if let Some(v) = row.get::<&str, _>(index) {
+    // `Row::get` panics on type mismatch; try_get returns Err instead.
+    if let Ok(Some(v)) = row.try_get::<&str, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<i32, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<i32, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<i64, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<i64, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<i16, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<i16, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<u8, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<u8, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<bool, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<bool, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<f64, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<f64, _>(index) {
         return v.to_string();
     }
-    if let Some(v) = row.get::<f32, _>(index) {
+    if let Ok(Some(v)) = row.try_get::<f32, _>(index) {
+        return v.to_string();
+    }
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(index) {
+        return v.to_string();
+    }
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(index) {
+        return v.to_string();
+    }
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(index) {
         return v.to_string();
     }
     String::new()

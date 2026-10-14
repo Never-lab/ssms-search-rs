@@ -205,13 +205,22 @@ impl SsmsApp {
         T: Send + 'static,
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     {
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("ssms-sql".into())
-            .spawn(job)
-            .map_err(|e| format!("spawn sql thread: {e}"))?
-            .join()
-            .map_err(|_| "SQL worker thread panicked".to_string())?
-            .map_err(|e| format!("{e:#}"))
+            .spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)))
+            .map_err(|e| format!("spawn sql thread: {e}"))?;
+        match handle.join().map_err(|_| "SQL worker thread join failed".to_string())? {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                Err(format!("SQL worker panicked: {msg}"))
+            }
+        }
     }
 
     fn try_connect(&mut self) {
