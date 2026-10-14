@@ -156,7 +156,7 @@ impl Catalog {
                 "Columns",
                 "",
                 "",
-                format!("{table_urn}/Column"),
+                format!("{table_urn}/Columns"),
             );
             let idxs = add(
                 Some(employee_id),
@@ -164,7 +164,7 @@ impl Catalog {
                 "Indexes",
                 "",
                 "",
-                format!("{table_urn}/Index"),
+                format!("{table_urn}/Indexes"),
             );
             add(
                 Some(cols),

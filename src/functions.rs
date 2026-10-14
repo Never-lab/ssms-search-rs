@@ -181,14 +181,7 @@ ORDER BY \
         let object_urn = format!(
             "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/{type_urn}[@Name='{name_esc}' and @Schema='{schema_esc}']"
         );
-        let object_id = add(
-            Some(parent),
-            kind,
-            name,
-            schema,
-            owner,
-            object_urn.clone(),
-        );
+        let object_id = add(Some(parent), kind, name, schema, owner, object_urn.clone());
         if kind == ObjectKind::Table {
             add(
                 Some(object_id),
@@ -321,6 +314,88 @@ pub async fn describe_object(
             is_nullable: row.get::<bool, _>(3).unwrap_or(false),
         })
         .collect())
+}
+
+/// Load Columns and Indexes leaves for one table. Ids start at `start_id` (caller owns id space).
+#[allow(clippy::too_many_arguments)]
+pub async fn load_table_children(
+    client: &mut SqlClient,
+    database: &str,
+    server: &str,
+    schema: &str,
+    table_name: &str,
+    columns_folder_id: u64,
+    indexes_folder_id: u64,
+    start_id: u64,
+) -> Result<Vec<CatalogObject>> {
+    use_database(client, database).await?;
+    let table_urn = format!(
+        "Server[@Name='{}']/Database[@Name='{}']/Table[@Name='{}' and @Schema='{}']",
+        escape_urn(server),
+        escape_urn(database),
+        escape_urn(table_name),
+        escape_urn(schema)
+    );
+    let mut out = Vec::new();
+    let mut next = start_id;
+    let mut push = |parent: u64, kind: ObjectKind, name: &str, leaf: &str| {
+        out.push(CatalogObject {
+            id: next,
+            parent_id: Some(parent),
+            kind,
+            name: name.to_string(),
+            schema: schema.to_string(),
+            owner: String::new(),
+            urn: child_leaf_urn(&table_urn, leaf, name),
+        });
+        next += 1;
+    };
+
+    let cols = client
+        .query(
+            "SELECT c.name \
+             FROM sys.columns AS c \
+             INNER JOIN sys.types AS t ON c.user_type_id = t.user_type_id \
+             INNER JOIN sys.objects AS o ON c.object_id = o.object_id \
+             INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id \
+             WHERE s.name = @P1 AND o.name = @P2 \
+             ORDER BY c.column_id",
+            &[&schema, &table_name],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+    for row in cols {
+        push(
+            columns_folder_id,
+            ObjectKind::Column,
+            row.get::<&str, _>(0).unwrap_or(""),
+            "Column",
+        );
+    }
+
+    let idx = client
+        .query(
+            "SELECT i.name \
+             FROM sys.indexes AS i \
+             INNER JOIN sys.tables AS t ON i.object_id = t.object_id \
+             INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id \
+             WHERE s.name = @P1 AND t.name = @P2 AND i.index_id > 0 AND i.name IS NOT NULL \
+             ORDER BY i.name",
+            &[&schema, &table_name],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+    for row in idx {
+        push(
+            indexes_folder_id,
+            ObjectKind::Index,
+            row.get::<&str, _>(0).unwrap_or(""),
+            "Index",
+        );
+    }
+    Ok(out)
 }
 
 /// Reject mutating/DDL batches used by the query helper / GUI Execute path.
@@ -546,6 +621,10 @@ fn table_child_folder_urn(table_urn: &str, folder: &str) -> String {
     format!("{table_urn}/{folder}")
 }
 
+fn child_leaf_urn(table_urn: &str, kind: &str, name: &str) -> String {
+    format!("{table_urn}/{kind}[@Name='{}']", escape_urn(name))
+}
+
 fn escape_urn(s: &str) -> String {
     s.replace('\'', "''")
 }
@@ -638,6 +717,23 @@ mod tests {
         assert_eq!(
             table_child_folder_urn(base, "Indexes"),
             format!("{base}/Indexes")
+        );
+    }
+
+    #[test]
+    fn column_and_index_urn_shapes() {
+        let table = "Server[@Name='s']/Database[@Name='d']/Table[@Name='T' and @Schema='dbo']";
+        assert_eq!(
+            child_leaf_urn(table, "Column", "Id"),
+            format!("{table}/Column[@Name='Id']")
+        );
+        assert_eq!(
+            child_leaf_urn(table, "Index", "PK"),
+            format!("{table}/Index[@Name='PK']")
+        );
+        assert_eq!(
+            child_leaf_urn(table, "Column", "O'B"),
+            format!("{table}/Column[@Name='O''B']")
         );
     }
 

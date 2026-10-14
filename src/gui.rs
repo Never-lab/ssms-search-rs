@@ -48,6 +48,7 @@ enum QueryBottomTab {
 pub struct SsmsApp {
     catalog: Catalog,
     expanded: HashSet<u64>,
+    loaded_folders: HashSet<u64>,
     selected_id: Option<u64>,
     workspace: Workspace,
     explorer_tab: ExplorerTab,
@@ -87,6 +88,7 @@ impl SsmsApp {
         let mut app = Self {
             catalog,
             expanded,
+            loaded_folders: HashSet::new(),
             selected_id: None,
             workspace: Workspace::Explorer,
             explorer_tab: ExplorerTab::ObjectExplorerDetails,
@@ -182,6 +184,7 @@ impl SsmsApp {
     fn load_demo(&mut self) {
         self.catalog = Catalog::demo();
         self.expanded.clear();
+        self.loaded_folders.clear();
         if let Some(root) = self.catalog.children(None).first() {
             self.expanded.insert(root.id);
         }
@@ -233,6 +236,7 @@ impl SsmsApp {
             Ok((catalog, server, db, login)) => {
                 self.catalog = catalog;
                 self.expanded.clear();
+                self.loaded_folders.clear();
                 if let Some(root) = self.catalog.children(None).first() {
                     self.expanded.insert(root.id);
                 }
@@ -476,6 +480,109 @@ impl SsmsApp {
         });
     }
 
+    fn toggle_node(&mut self, id: u64, open: bool) {
+        if open {
+            self.expanded.remove(&id);
+        } else {
+            self.expanded.insert(id);
+            self.load_folder_children(id);
+        }
+    }
+
+    /// Lazy-load Columns/Indexes for a live table when its folder is first opened.
+    fn load_folder_children(&mut self, folder_id: u64) {
+        if self.is_demo || !self.connected || self.loaded_folders.contains(&folder_id) {
+            return;
+        }
+        let Some(folder) = self.catalog.by_id(folder_id) else {
+            return;
+        };
+        if folder.kind != ObjectKind::Folder
+            || !matches!(folder.name.as_str(), "Columns" | "Indexes")
+        {
+            return;
+        }
+        if !self.catalog.children(Some(folder_id)).is_empty() {
+            self.loaded_folders.insert(folder_id);
+            return;
+        }
+        let Some(table) = folder
+            .parent_id
+            .and_then(|p| self.catalog.by_id(p))
+            .filter(|t| t.kind == ObjectKind::Table)
+        else {
+            return;
+        };
+        let find = |name: &str| {
+            self.catalog
+                .children(Some(table.id))
+                .into_iter()
+                .find(|o| o.kind == ObjectKind::Folder && o.name == name)
+                .map(|o| o.id)
+        };
+        let (Some(cols_id), Some(idx_id)) = (find("Columns"), find("Indexes")) else {
+            return;
+        };
+        let Some(server) = self
+            .catalog
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .map(|o| o.name.clone())
+        else {
+            return;
+        };
+        let Some(database) = self
+            .catalog
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Database)
+            .map(|o| o.name.clone())
+        else {
+            return;
+        };
+        let (schema, table_name) = (table.schema.clone(), table.name.clone());
+        let start_id = self.catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+        let args = self.connect_args();
+        self.status_error = false;
+        self.status = format!("Loading {schema}.{table_name} columns and indexes…");
+
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::load_table_children(
+                    &mut client,
+                    &database,
+                    &server,
+                    &schema,
+                    &table_name,
+                    cols_id,
+                    idx_id,
+                    start_id,
+                )
+                .await
+            })
+        });
+
+        match result {
+            Ok(new) => {
+                self.status = format!("Loaded {} column/index item(s)", new.len());
+                self.catalog.objects.extend(new);
+                self.loaded_folders.insert(cols_id);
+                self.loaded_folders.insert(idx_id);
+                self.refresh_object_hits();
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Load table children failed: {e}");
+            }
+        }
+    }
+
     fn draw_tree_node(&mut self, ui: &mut egui::Ui, id: u64, depth: usize) {
         let (name, expandable) = {
             let Some(obj) = self.catalog.by_id(id) else {
@@ -483,7 +590,11 @@ impl SsmsApp {
             };
             let expandable = matches!(
                 obj.kind,
-                ObjectKind::Server | ObjectKind::Database | ObjectKind::Folder | ObjectKind::Schema
+                ObjectKind::Server
+                    | ObjectKind::Database
+                    | ObjectKind::Folder
+                    | ObjectKind::Schema
+                    | ObjectKind::Table
             );
             let name = if obj.schema.is_empty() {
                 format!("{} {}", kind_glyph(obj.kind), obj.name)
@@ -501,11 +612,7 @@ impl SsmsApp {
             if expandable {
                 let twisty = if open { "▼" } else { "▶" };
                 if ui.add(egui::Button::new(twisty).frame(false)).clicked() {
-                    if open {
-                        self.expanded.remove(&id);
-                    } else {
-                        self.expanded.insert(id);
-                    }
+                    self.toggle_node(id, open);
                 }
             } else {
                 ui.add_space(18.0);
@@ -533,11 +640,7 @@ impl SsmsApp {
                 }
             }
             if resp.double_clicked() && expandable {
-                if open {
-                    self.expanded.remove(&id);
-                } else {
-                    self.expanded.insert(id);
-                }
+                self.toggle_node(id, open);
             }
         });
 
