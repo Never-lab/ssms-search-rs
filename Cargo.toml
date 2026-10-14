@@ -1,8 +1,8 @@
 [package]
 name = "ssms-search-rs"
-version = "0.5.1"
+version = "0.6.0-alpha.1"
 edition = "2021"
-description = "SSMS-inspired Object Explorer + Query + Execution Plan (egui)"
+description = "SSMS-inspired Object Explorer + Query + Execution Plan (egui) — alpha"
 license = "MIT"
 publish = false
 
@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 eframe = { version = "0.31", default-features = true, features = ["default_fonts", "glow"] }
 egui = "0.31"

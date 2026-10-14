@@ -1,2 +1,3 @@
-ssms-search-rs 0.5.1 — fix Connect crash (nested Tokio runtime)
-Built: 2026-10-14 10:40:35
+ssms-search-rs — release build
+Built: 2026-10-14 15:56:11
+Binary: release\ssms-search-rs.exe

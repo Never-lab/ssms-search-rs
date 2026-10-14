@@ -2,12 +2,13 @@
 
 use anyhow::Context;
 use eframe::egui::{
-    self, Color32, CornerRadius, Frame, Key, Margin, RichText, Sense, Stroke, Vec2,
+    self, Color32, CornerRadius, Frame, Key, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
 use ssms_search_rs::connection::{connect, ping, ConnectArgs};
 use ssms_search_rs::filter::{FilterItem, FilterOperator, SearchConditions};
-use ssms_search_rs::functions::{self, PlanMode, QueryExecution, QueryResult};
+use ssms_search_rs::functions::{self, ColumnInfo, PlanMode, QueryExecution, QueryResult};
 use ssms_search_rs::plan::PlanOperator;
+use ssms_search_rs::plan_children;
 use ssms_search_rs::{Catalog, CatalogObject, ObjectKind};
 use std::collections::HashSet;
 
@@ -48,6 +49,10 @@ enum QueryBottomTab {
 pub struct SsmsApp {
     catalog: Catalog,
     expanded: HashSet<u64>,
+    loaded_folders: HashSet<u64>,
+    loaded_databases: HashSet<u64>,
+    /// Columns from "Describe columns…" for the object id.
+    described: Option<(u64, Vec<ColumnInfo>)>,
     selected_id: Option<u64>,
     workspace: Workspace,
     explorer_tab: ExplorerTab,
@@ -63,6 +68,8 @@ pub struct SsmsApp {
     connection_label: String,
     is_demo: bool,
     connected: bool,
+    /// Args of the live session; every post-connect SQL job uses these, not the form.
+    session_args: Option<ConnectArgs>,
     status: String,
     status_error: bool,
     object_hits: Vec<u64>,
@@ -87,6 +94,9 @@ impl SsmsApp {
         let mut app = Self {
             catalog,
             expanded,
+            loaded_folders: HashSet::new(),
+            loaded_databases: HashSet::new(),
+            described: None,
             selected_id: None,
             workspace: Workspace::Explorer,
             explorer_tab: ExplorerTab::ObjectExplorerDetails,
@@ -102,6 +112,7 @@ impl SsmsApp {
             connection_label: "Demo catalog".into(),
             is_demo: true,
             connected: false,
+            session_args: None,
             status: "Ready — connect or use demo, then New Query".into(),
             status_error: false,
             object_hits: Vec::new(),
@@ -143,11 +154,22 @@ impl SsmsApp {
             .collect();
         if !self.status_error && self.workspace == Workspace::Explorer {
             let n = self.object_hits.len();
-            self.status = if self.conditions.is_empty() {
+            let mut status = if self.conditions.is_empty() {
                 format!("{n} object(s)")
             } else {
                 format!("{n} object(s) matching filter")
             };
+            if self.connected && !self.is_demo {
+                let total = self.catalog.database_count();
+                if total > 1 {
+                    status.push_str(&format!(
+                        " · {}/{} databases loaded",
+                        self.loaded_databases.len(),
+                        total
+                    ));
+                }
+            }
+            self.status = status;
         }
     }
 
@@ -182,12 +204,16 @@ impl SsmsApp {
     fn load_demo(&mut self) {
         self.catalog = Catalog::demo();
         self.expanded.clear();
+        self.loaded_folders.clear();
+        self.loaded_databases.clear();
+        self.described = None;
         if let Some(root) = self.catalog.children(None).first() {
             self.expanded.insert(root.id);
         }
         self.selected_id = None;
         self.is_demo = true;
         self.connected = false;
+        self.session_args = None;
         self.connection_label = "Demo catalog".into();
         self.status_error = false;
         self.status = "Loaded demo catalog".into();
@@ -202,19 +228,41 @@ impl SsmsApp {
         T: Send + 'static,
         F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     {
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("ssms-sql".into())
-            .spawn(job)
-            .map_err(|e| format!("spawn sql thread: {e}"))?
+            .spawn(move || std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)))
+            .map_err(|e| format!("spawn sql thread: {e}"))?;
+        match handle
             .join()
-            .map_err(|_| "SQL worker thread panicked".to_string())?
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|_| "SQL worker thread join failed".to_string())?
+        {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                Err(format!("SQL worker panicked: {msg}"))
+            }
+        }
     }
 
-    fn try_connect(&mut self) {
-        let args = self.connect_args();
+    /// Connect (or `refresh` an existing session: same args, keep old tree on failure).
+    fn try_connect(&mut self, refresh: bool) {
+        let args = match (refresh, self.session_args.clone()) {
+            (true, Some(a)) => a,
+            _ => self.connect_args(),
+        };
+        let session = args.clone();
         self.status_error = false;
-        self.status = "Connecting…".into();
+        self.status = if refresh {
+            "Refreshing…"
+        } else {
+            "Connecting…"
+        }
+        .into();
 
         let result = self.sql_job(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -224,7 +272,8 @@ impl SsmsApp {
             rt.block_on(async {
                 let mut client = connect(&args).await?;
                 let (server, db, login) = ping(&mut client).await?;
-                let catalog = functions::load_catalog(&mut client, &server, &args.database).await?;
+                let catalog =
+                    functions::load_server_catalog(&mut client, &server, &args.database).await?;
                 Ok::<_, anyhow::Error>((catalog, server, db, login))
             })
         });
@@ -233,22 +282,39 @@ impl SsmsApp {
             Ok((catalog, server, db, login)) => {
                 self.catalog = catalog;
                 self.expanded.clear();
+                self.loaded_folders.clear();
+                self.loaded_databases.clear();
+                self.described = None;
                 if let Some(root) = self.catalog.children(None).first() {
                     self.expanded.insert(root.id);
+                    // The preferred database arrives fully populated: expand it.
+                    let preloaded: Vec<u64> = self
+                        .catalog
+                        .children(Some(root.id))
+                        .into_iter()
+                        .filter(|d| !self.catalog.children(Some(d.id)).is_empty())
+                        .map(|d| d.id)
+                        .collect();
+                    self.expanded.extend(&preloaded);
+                    self.loaded_databases.extend(preloaded);
                 }
                 self.selected_id = None;
                 self.is_demo = false;
                 self.connected = true;
+                self.session_args = Some(session);
                 self.connection_label = format!("{server} · {db} · {login}");
                 self.status_error = false;
-                self.status = "Connected".into();
+                self.status = if refresh { "Refreshed" } else { "Connected" }.into();
                 self.show_connect = false;
                 self.refresh_object_hits();
             }
             Err(e) => {
-                self.connected = false;
+                self.connected = refresh && self.connected;
                 self.status_error = true;
-                self.status = format!("Connect failed: {e}");
+                self.status = format!(
+                    "{} failed: {e}",
+                    if refresh { "Refresh" } else { "Connect" }
+                );
             }
         }
     }
@@ -261,7 +327,9 @@ impl SsmsApp {
             return;
         }
         let sql = self.sql_text.clone();
-        let args = self.connect_args();
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
         self.status = "Executing…".into();
         self.status_error = false;
 
@@ -334,11 +402,34 @@ impl SsmsApp {
         ctx.set_style(style);
     }
 
+    fn show_engine_trace(&mut self) {
+        let report = ssms_search_rs::format_engine_trace();
+        self.query_messages = report.lines().map(|l| l.to_string()).collect();
+        if self.query_messages.is_empty() {
+            self.query_messages
+                .push("No engine trace events yet.".into());
+        }
+        self.workspace = Workspace::Query;
+        self.query_bottom = QueryBottomTab::Messages;
+        self.status_error = false;
+        self.status = format!(
+            "Engine trace — {} event(s)",
+            ssms_search_rs::engine_trace_snapshot().len()
+        );
+    }
+
     fn draw_menu(&mut self, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Connect to Server…").clicked() {
                     self.show_connect = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(self.connected, egui::Button::new("Refresh"))
+                    .clicked()
+                {
+                    self.try_connect(true);
                     ui.close_menu();
                 }
                 if ui.button("Load Demo Catalog").clicked() {
@@ -383,6 +474,17 @@ impl SsmsApp {
                     self.show_filter = true;
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui.button("Engine Trace…").clicked() {
+                    self.show_engine_trace();
+                    ui.close_menu();
+                }
+                if ui.button("Clear Engine Trace").clicked() {
+                    ssms_search_rs::clear_engine_trace();
+                    self.status = "Engine trace cleared".into();
+                    self.status_error = false;
+                    ui.close_menu();
+                }
                 if ui.button("Clear Filter").clicked() {
                     self.clear_filter();
                     ui.close_menu();
@@ -407,22 +509,29 @@ impl SsmsApp {
         ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(
-                    RichText::new("⚡ Connect").color(ssms_colors::ACCENT),
+                    RichText::new("Connect").color(ssms_colors::ACCENT),
                 ))
                 .clicked()
             {
                 self.show_connect = true;
             }
+            if ui
+                .add_enabled(self.connected, egui::Button::new("Refresh"))
+                .on_hover_text("Reload databases and objects (no reconnect dialog)")
+                .clicked()
+            {
+                self.try_connect(true);
+            }
             ui.separator();
             if ui
-                .add(egui::Button::new(RichText::new("🗒 New Query").strong()))
+                .add(egui::Button::new(RichText::new("New Query").strong()))
                 .on_hover_text("Open SQL editor")
                 .clicked()
             {
                 self.new_query();
             }
             let exec_btn = ui.add(
-                egui::Button::new(RichText::new("▶ Execute").color(Color32::WHITE))
+                egui::Button::new(RichText::new("Execute").color(Color32::WHITE))
                     .fill(ssms_colors::EXEC),
             );
             if exec_btn.on_hover_text("Execute (F5)").clicked() {
@@ -434,7 +543,7 @@ impl SsmsApp {
                 self.execute_query(mode);
             }
             if ui
-                .button("📈 Estimated Plan")
+                .button("Estimated Plan")
                 .on_hover_text("SET SHOWPLAN_XML — does not run the query")
                 .clicked()
             {
@@ -444,7 +553,7 @@ impl SsmsApp {
             ui.separator();
             if ui
                 .add(egui::Button::new(
-                    RichText::new("🔍 Filter").color(ssms_colors::TITLE),
+                    RichText::new("Filter").color(ssms_colors::TITLE),
                 ))
                 .clicked()
             {
@@ -460,7 +569,13 @@ impl SsmsApp {
         ui.label(
             RichText::new("Object Explorer")
                 .color(ssms_colors::TITLE)
-                .strong(),
+                .strong()
+                .size(15.0),
+        );
+        ui.label(
+            RichText::new(&self.connection_label)
+                .color(ssms_colors::MUTED)
+                .small(),
         );
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -476,71 +591,324 @@ impl SsmsApp {
         });
     }
 
+    fn toggle_node(&mut self, id: u64, open: bool) {
+        if open {
+            self.expanded.remove(&id);
+        } else {
+            self.expanded.insert(id);
+            self.load_database_children(id);
+            self.load_folder_children(id);
+        }
+    }
+
+    fn server_name(&self) -> Option<String> {
+        self.catalog
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .map(|o| o.name.clone())
+    }
+
+    /// Populate a live Database node the first time it is expanded.
+    fn load_database_children(&mut self, db_id: u64) {
+        if self.is_demo || !self.connected || self.loaded_databases.contains(&db_id) {
+            return;
+        }
+        let Some(db) = self
+            .catalog
+            .by_id(db_id)
+            .filter(|o| o.kind == ObjectKind::Database)
+        else {
+            return;
+        };
+        let database = db.name.clone();
+        let Some(server) = self.server_name() else {
+            return;
+        };
+        if !self.catalog.children(Some(db_id)).is_empty() {
+            self.loaded_databases.insert(db_id);
+            return;
+        }
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
+        let mut catalog = self.catalog.clone();
+        self.status_error = false;
+        self.status = format!("Loading database {database}…");
+
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::ensure_database_loaded(
+                    &mut client,
+                    &server,
+                    &database,
+                    &mut catalog,
+                    db_id,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((catalog, database))
+            })
+        });
+
+        match result {
+            Ok((catalog, database)) => {
+                self.catalog = catalog;
+                self.loaded_databases.insert(db_id);
+                self.status = format!("Loaded database {database}");
+                self.refresh_object_hits();
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Load database failed: {e}");
+            }
+        }
+    }
+
+    /// Properties → "Describe columns…" (Table/View).
+    fn describe_selected(&mut self) {
+        let Some(o) = self.selected_object().cloned() else {
+            return;
+        };
+        let Some(database) = self.catalog.database_name_of(o.id).map(str::to_string) else {
+            return;
+        };
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
+        let (schema, name) = (o.schema.clone(), o.name.clone());
+        self.status_error = false;
+        self.status = format!("Describing {schema}.{name}…");
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::describe_object(&mut client, &database, &schema, &name).await
+            })
+        });
+        match result {
+            Ok(cols) => {
+                self.status = format!("{} column(s) for {}.{}", cols.len(), o.schema, o.name);
+                self.described = Some((o.id, cols));
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Describe failed: {e}");
+            }
+        }
+    }
+
+    /// Properties → "Script definition…" (Procedure/Function/View/Trigger) into the query editor.
+    fn script_selected(&mut self) {
+        let Some(o) = self.selected_object().cloned() else {
+            return;
+        };
+        let Some(database) = self.catalog.database_name_of(o.id).map(str::to_string) else {
+            return;
+        };
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
+        let (schema, name) = (o.schema.clone(), o.name.clone());
+        self.status_error = false;
+        self.status = format!("Scripting {schema}.{name}…");
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::object_definition(&mut client, &database, &schema, &name).await
+            })
+        });
+        match result {
+            Ok(sql) => {
+                self.sql_text = sql;
+                self.new_query();
+                self.status = format!("Scripted {}.{}", o.schema, o.name);
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Script failed: {e}");
+            }
+        }
+    }
+
+    /// Lazy-load Columns/Indexes for a live table when its folder is first opened.
+    fn load_folder_children(&mut self, folder_id: u64) {
+        if self.is_demo || !self.connected || self.loaded_folders.contains(&folder_id) {
+            return;
+        }
+        let Some(folder) = self.catalog.by_id(folder_id) else {
+            return;
+        };
+        if folder.kind != ObjectKind::Folder
+            || !matches!(folder.name.as_str(), "Columns" | "Indexes")
+        {
+            return;
+        }
+        if !self.catalog.children(Some(folder_id)).is_empty() {
+            self.loaded_folders.insert(folder_id);
+            return;
+        }
+        let Some(table) = folder
+            .parent_id
+            .and_then(|p| self.catalog.by_id(p))
+            .filter(|t| t.kind == ObjectKind::Table)
+        else {
+            return;
+        };
+        let find = |name: &str| {
+            self.catalog
+                .children(Some(table.id))
+                .into_iter()
+                .find(|o| o.kind == ObjectKind::Folder && o.name == name)
+                .map(|o| o.id)
+        };
+        let (Some(cols_id), Some(idx_id)) = (find("Columns"), find("Indexes")) else {
+            return;
+        };
+        let Some(server) = self
+            .catalog
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .map(|o| o.name.clone())
+        else {
+            return;
+        };
+        let Some(database) = self.catalog.database_name_of(table.id).map(str::to_string) else {
+            return;
+        };
+        let (schema, table_name) = (table.schema.clone(), table.name.clone());
+        let start_id = self.catalog.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+        let Some(args) = self.session_args.clone() else {
+            return;
+        };
+        self.status_error = false;
+        self.status = format!("Loading {schema}.{table_name} columns and indexes…");
+
+        let result = self.sql_job(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("tokio")?;
+            rt.block_on(async {
+                let mut client = connect(&args).await?;
+                functions::load_table_children(
+                    &mut client,
+                    &database,
+                    &server,
+                    &schema,
+                    &table_name,
+                    cols_id,
+                    idx_id,
+                    start_id,
+                )
+                .await
+            })
+        });
+
+        match result {
+            Ok(new) => {
+                self.status = format!("Loaded {} column/index item(s)", new.len());
+                self.catalog.objects.extend(new);
+                self.loaded_folders.insert(cols_id);
+                self.loaded_folders.insert(idx_id);
+                self.refresh_object_hits();
+            }
+            Err(e) => {
+                self.status_error = true;
+                self.status = format!("Load table children failed: {e}");
+            }
+        }
+    }
+
     fn draw_tree_node(&mut self, ui: &mut egui::Ui, id: u64, depth: usize) {
-        let (name, expandable) = {
+        let (name, expandable, kind) = {
             let Some(obj) = self.catalog.by_id(id) else {
                 return;
             };
+            let kind = obj.kind;
             let expandable = matches!(
-                obj.kind,
-                ObjectKind::Server | ObjectKind::Database | ObjectKind::Folder | ObjectKind::Schema
+                kind,
+                ObjectKind::Server
+                    | ObjectKind::Database
+                    | ObjectKind::Folder
+                    | ObjectKind::Schema
+                    | ObjectKind::Table
             );
-            let name = if obj.schema.is_empty() {
-                format!("{} {}", kind_glyph(obj.kind), obj.name)
+            let name = if matches!(kind, ObjectKind::Column | ObjectKind::Index)
+                || obj.schema.is_empty()
+            {
+                format!("{} {}", kind_glyph(kind), obj.name)
             } else {
-                format!("{} {}.{}", kind_glyph(obj.kind), obj.schema, obj.name)
+                format!("{} {}.{}", kind_glyph(kind), obj.schema, obj.name)
             };
-            (name, expandable)
+            (name, expandable, kind)
         };
 
         let selected = self.selected_id == Some(id);
         let open = self.expanded.contains(&id);
 
-        ui.horizontal(|ui| {
-            ui.add_space((depth as f32) * 14.0);
-            if expandable {
-                let twisty = if open { "▼" } else { "▶" };
-                if ui.add(egui::Button::new(twisty).frame(false)).clicked() {
-                    if open {
-                        self.expanded.remove(&id);
-                    } else {
-                        self.expanded.insert(id);
-                    }
-                }
-            } else {
-                ui.add_space(18.0);
-            }
-
-            let text = if selected {
-                RichText::new(name).strong()
-            } else {
-                RichText::new(name)
-            };
-            let resp = ui.add(
-                egui::Button::new(text)
-                    .fill(if selected {
-                        ssms_colors::SEL
-                    } else {
-                        Color32::TRANSPARENT
-                    })
-                    .frame(selected),
+        let (rect, resp) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 20.0),
+            Sense::click(),
+        );
+        let fill = if selected {
+            ssms_colors::SEL
+        } else if resp.hovered() {
+            ssms_colors::CHROME
+        } else {
+            Color32::TRANSPARENT
+        };
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, fill);
+        let x0 = rect.left() + 4.0 + depth as f32 * 16.0;
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        if expandable {
+            painter.text(
+                Pos2::new(x0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                if open { "v" } else { ">" },
+                font.clone(),
+                ssms_colors::MUTED,
             );
-            if resp.clicked() {
+        }
+        let label_x = x0 + 16.0;
+        painter.text(
+            Pos2::new(label_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            font,
+            ssms_colors::TEXT,
+        );
+
+        let on_twisty = resp
+            .interact_pointer_pos()
+            .is_some_and(|p| p.x < label_x);
+        if resp.clicked() {
+            if expandable && on_twisty {
+                self.toggle_node(id, open);
+            } else {
                 self.selected_id = Some(id);
-                if !expandable {
+                if !expandable || kind == ObjectKind::Table {
                     self.workspace = Workspace::Explorer;
                     self.explorer_tab = ExplorerTab::Properties;
                 }
             }
-            if resp.double_clicked() && expandable {
-                if open {
-                    self.expanded.remove(&id);
-                } else {
-                    self.expanded.insert(id);
-                }
-            }
-        });
-
+        }
+        if resp.double_clicked() && expandable && !on_twisty {
+            self.toggle_node(id, open);
+        }
         if expandable && self.expanded.contains(&id) {
             let children: Vec<u64> = self
                 .catalog
@@ -601,16 +969,16 @@ impl SsmsApp {
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("results_grid")
                 .striped(true)
-                .num_columns(4)
-                .min_col_width(80.0)
+                .num_columns(5)
+                .min_col_width(56.0)
+                .spacing([10.0, 2.0])
                 .show(ui, |ui| {
-                    ui.strong("Type");
-                    ui.strong("Name");
-                    ui.strong("Schema");
-                    ui.strong("Owner");
+                    for h in ["Type", "Name", "Schema", "Database", "Owner"] {
+                        ui.label(RichText::new(h).strong().color(ssms_colors::TITLE));
+                    }
                     ui.end_row();
 
-                    let rows: Vec<(u64, String, String, String, String)> = self
+                    let rows: Vec<(u64, String, String, String, String, String)> = self
                         .object_hits
                         .iter()
                         .filter_map(|id| {
@@ -620,19 +988,25 @@ impl SsmsApp {
                             } else {
                                 format!("{}.{}", o.schema, o.name)
                             };
+                            let database = self
+                                .catalog
+                                .database_name_of(o.id)
+                                .unwrap_or("")
+                                .to_string();
                             Some((
                                 *id,
                                 format!("{} {}", kind_glyph(o.kind), short_type(o.kind)),
                                 name,
                                 o.schema.clone(),
+                                database,
                                 o.owner.clone(),
                             ))
                         })
                         .collect();
 
-                    for (id, ty, name, schema, owner) in rows {
+                    for (id, ty, name, schema, database, owner) in rows {
                         let selected = self.selected_id == Some(id);
-                        for cell in [ty, name, schema, owner] {
+                        for cell in [ty, name, schema, database, owner] {
                             let resp = ui.add(
                                 egui::Label::new(RichText::new(cell).color(ssms_colors::TEXT))
                                     .sense(Sense::click()),
@@ -659,14 +1033,9 @@ impl SsmsApp {
     }
 
     fn draw_properties(&mut self, ui: &mut egui::Ui) {
-        if let Some(o) = self.selected_object() {
-            let rows = [
-                ("Name", o.name.as_str()),
-                ("Schema", o.schema.as_str()),
-                ("Owner", o.owner.as_str()),
-                ("Type", o.kind.as_str()),
-                ("URN", o.urn.as_str()),
-            ];
+        if let Some(o) = self.selected_object().cloned() {
+            let mut rows = o.props().to_vec();
+            rows.push(("URN", o.urn.as_str()));
             egui::Grid::new("props_grid")
                 .num_columns(2)
                 .spacing([12.0, 6.0])
@@ -678,14 +1047,57 @@ impl SsmsApp {
                     }
                 });
             ui.add_space(8.0);
-            if ui.button("Script as SELECT TOP 100…").clicked() {
-                let q = if o.schema.is_empty() {
-                    format!("SELECT TOP (100) *\nFROM [{}];\n", o.name)
-                } else {
-                    format!("SELECT TOP (100) *\nFROM [{}].[{}];\n", o.schema, o.name)
-                };
-                self.sql_text = q;
-                self.new_query();
+            let table_like = matches!(o.kind, ObjectKind::Table | ObjectKind::View);
+            let module = matches!(
+                o.kind,
+                ObjectKind::Procedure
+                    | ObjectKind::Function
+                    | ObjectKind::View
+                    | ObjectKind::Trigger
+            );
+            ui.horizontal(|ui| {
+                if table_like && ui.button("Script as SELECT TOP 100…").clicked() {
+                    self.sql_text =
+                        format!("SELECT TOP (100) *\nFROM [{}].[{}];\n", o.schema, o.name);
+                    self.new_query();
+                }
+                if table_like
+                    && ui
+                        .add_enabled(self.connected, egui::Button::new("Describe columns…"))
+                        .on_disabled_hover_text("Connect to a SQL Server first")
+                        .clicked()
+                {
+                    self.describe_selected();
+                }
+                if module
+                    && ui
+                        .add_enabled(self.connected, egui::Button::new("Script definition…"))
+                        .on_disabled_hover_text("Connect to a SQL Server first")
+                        .clicked()
+                {
+                    self.script_selected();
+                }
+            });
+            if let Some((_, cols)) = self.described.as_ref().filter(|(id, _)| *id == o.id) {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Columns").color(ssms_colors::TITLE).strong());
+                egui::Grid::new("describe_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        for h in ["Name", "Type", "Max length", "Nullable"] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for c in cols {
+                            ui.label(&c.name);
+                            ui.label(&c.data_type);
+                            ui.label(c.max_length.to_string());
+                            ui.label(if c.is_nullable { "yes" } else { "no" });
+                            ui.end_row();
+                        }
+                    });
             }
         } else {
             ui.label(
@@ -699,7 +1111,7 @@ impl SsmsApp {
     fn draw_query_workspace(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!(" 🗒 {} ", self.query_tab_title))
+                RichText::new(&self.query_tab_title)
                     .color(ssms_colors::TITLE)
                     .strong(),
             );
@@ -713,30 +1125,52 @@ impl SsmsApp {
         ui.separator();
 
         let total = ui.available_height();
-        let editor_h = (total * 0.45).clamp(140.0, 360.0);
+        let editor_h = (total * 0.50).clamp(180.0, 420.0);
 
-        egui::ScrollArea::vertical()
-            .id_salt("sql_editor_scroll")
-            .max_height(editor_h)
+        Frame::new()
+            .fill(ssms_colors::PANEL)
+            .stroke(Stroke::new(1.0_f32, ssms_colors::BORDER))
+            .inner_margin(Margin::same(4))
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.sql_text)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(12)
-                        .font(egui::TextStyle::Monospace),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("sql_editor_scroll")
+                    .max_height(editor_h)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.sql_text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(12)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
             });
 
-        ui.separator();
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.query_bottom, QueryBottomTab::Results, "Results");
-            ui.selectable_value(&mut self.query_bottom, QueryBottomTab::Messages, "Messages");
-            ui.selectable_value(
-                &mut self.query_bottom,
-                QueryBottomTab::ExecutionPlan,
-                "Execution Plan",
-            );
+            for (tab, label) in [
+                (QueryBottomTab::Results, "Results"),
+                (QueryBottomTab::Messages, "Messages"),
+                (QueryBottomTab::ExecutionPlan, "Execution Plan"),
+            ] {
+                let active = self.query_bottom == tab;
+                let text = if active {
+                    RichText::new(label).strong().color(ssms_colors::TEXT)
+                } else {
+                    RichText::new(label).color(ssms_colors::MUTED)
+                };
+                let resp = ui.add(egui::Button::new(text).frame(false));
+                if active {
+                    let y = resp.rect.bottom() + 1.0;
+                    ui.painter().line_segment(
+                        [Pos2::new(resp.rect.left(), y), Pos2::new(resp.rect.right(), y)],
+                        Stroke::new(2.0_f32, ssms_colors::ACCENT),
+                    );
+                }
+                if resp.clicked() {
+                    self.query_bottom = tab;
+                }
+            }
         });
         ui.separator();
 
@@ -767,10 +1201,11 @@ impl SsmsApp {
             egui::Grid::new("query_result_grid")
                 .striped(true)
                 .num_columns(cols.len().max(1))
-                .min_col_width(72.0)
+                .min_col_width(56.0)
+                .spacing([10.0, 2.0])
                 .show(ui, |ui| {
                     for c in &cols {
-                        ui.strong(c);
+                        ui.label(RichText::new(c).strong().color(ssms_colors::TITLE));
                     }
                     if !cols.is_empty() {
                         ui.end_row();
@@ -795,11 +1230,10 @@ impl SsmsApp {
                 );
             }
             for msg in &self.query_messages {
-                ui.monospace(msg);
+                ui.label(RichText::new(msg).monospace());
             }
         });
     }
-
     fn draw_execution_plan(&mut self, ui: &mut egui::Ui) {
         if self.plan_operators.is_empty() {
             ui.label(
@@ -820,32 +1254,49 @@ impl SsmsApp {
             .small(),
         );
         let ops = self.plan_operators.clone();
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("plan_grid")
-                .striped(true)
-                .num_columns(5)
-                .min_col_width(70.0)
-                .show(ui, |ui| {
-                    ui.strong("NodeId");
-                    ui.strong("Physical Op");
-                    ui.strong("Logical Op");
-                    ui.strong("Est. Rows");
-                    ui.strong("Subtree Cost");
-                    ui.end_row();
-                    for op in &ops {
-                        ui.label(&op.node_id);
-                        ui.label(&op.physical_op);
-                        ui.label(&op.logical_op);
-                        ui.label(&op.estimate_rows);
-                        ui.label(&op.estimate_cost);
-                        ui.end_row();
-                    }
-                });
-        });
+        egui::ScrollArea::both()
+            .id_salt("plan_graph_scroll")
+            .max_height(ui.available_height() * 0.6)
+            .show(ui, |ui| draw_plan_graph(ui, &ops));
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Operator list")
+            .default_open(ops.len() <= 12)
+            .show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("plan_grid_scroll")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("plan_grid")
+                            .striped(true)
+                            .num_columns(5)
+                            .min_col_width(70.0)
+                            .show(ui, |ui| {
+                                for h in [
+                                    "NodeId",
+                                    "Physical Op",
+                                    "Logical Op",
+                                    "Est. Rows",
+                                    "Subtree Cost",
+                                ] {
+                                    ui.strong(h);
+                                }
+                                ui.end_row();
+                                for op in &ops {
+                                    ui.label(&op.node_id);
+                                    ui.label(&op.physical_op);
+                                    ui.label(&op.logical_op);
+                                    ui.label(&op.estimate_rows);
+                                    ui.label(&op.estimate_cost);
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
         if let Some(xml) = &self.plan_xml {
             ui.add_space(6.0);
             ui.collapsing("Raw ShowPlanXML", |ui| {
                 egui::ScrollArea::vertical()
+                    .id_salt("plan_xml_scroll")
                     .max_height(160.0)
                     .show(ui, |ui| {
                         ui.monospace(xml);
@@ -853,7 +1304,6 @@ impl SsmsApp {
             });
         }
     }
-
     fn draw_status(&self, ui: &mut egui::Ui) {
         ui.label(RichText::new(&self.status).color(Color32::WHITE));
     }
@@ -910,7 +1360,7 @@ impl SsmsApp {
                         )
                         .clicked()
                     {
-                        self.try_connect();
+                        self.try_connect(false);
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_connect = false;
@@ -944,7 +1394,7 @@ impl SsmsApp {
                         egui::ComboBox::from_id_salt("filter_col")
                             .selected_text(&self.filter_draft.column)
                             .show_ui(ui, |ui| {
-                                for c in ["Name", "Schema", "Owner", "Type"] {
+                                for c in ["Name", "Schema", "Owner", "Type", "Date"] {
                                     ui.selectable_value(
                                         &mut self.filter_draft.column,
                                         c.to_string(),
@@ -1071,16 +1521,99 @@ impl eframe::App for SsmsApp {
     }
 }
 
+const PLAN_BOX: Vec2 = Vec2::new(150.0, 56.0);
+const PLAN_GAP_X: f32 = 36.0;
+const PLAN_GAP_Y: f32 = 12.0;
+const PLAN_PAD: f32 = 12.0;
+
+/// Left-to-right tree layout: leaves get sequential rows, parents centre on their children.
+fn layout_plan(kids: &[Vec<usize>], i: usize, depth: usize, next_row: &mut f32, pos: &mut [Pos2]) {
+    for &c in &kids[i] {
+        layout_plan(kids, c, depth + 1, next_row, pos);
+    }
+    let y = if kids[i].is_empty() {
+        let y = *next_row;
+        *next_row += PLAN_BOX.y + PLAN_GAP_Y;
+        y
+    } else {
+        let (first, last) = (kids[i][0], *kids[i].last().unwrap());
+        (pos[first].y + pos[last].y) / 2.0
+    };
+    pos[i] = Pos2::new(depth as f32 * (PLAN_BOX.x + PLAN_GAP_X), y);
+}
+
+fn draw_plan_graph(ui: &mut egui::Ui, ops: &[PlanOperator]) {
+    let kids = plan_children(ops);
+    let mut pos = vec![Pos2::ZERO; ops.len()];
+    let mut next_row = 0.0;
+    for (i, op) in ops.iter().enumerate() {
+        if op.parent.is_none() {
+            layout_plan(&kids, i, 0, &mut next_row, &mut pos);
+        }
+    }
+    let size = pos.iter().fold(Vec2::ZERO, |m, p| {
+        Vec2::new(m.x.max(p.x + PLAN_BOX.x), m.y.max(p.y + PLAN_BOX.y))
+    }) + Vec2::splat(PLAN_PAD * 2.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let origin = rect.min + Vec2::splat(PLAN_PAD);
+    let painter = ui.painter_at(rect);
+    let edge = Stroke::new(1.0_f32, ssms_colors::BORDER);
+    let box_at = |i: usize| Rect::from_min_size(origin + pos[i].to_vec2(), PLAN_BOX);
+
+    for (p, cs) in kids.iter().enumerate() {
+        for &c in cs {
+            painter.line_segment([box_at(p).right_center(), box_at(c).left_center()], edge);
+        }
+    }
+    for (i, op) in ops.iter().enumerate() {
+        let r = box_at(i);
+        painter.rect_filled(r, CornerRadius::same(3), Color32::WHITE);
+        painter.rect_stroke(r, CornerRadius::same(3), edge, egui::StrokeKind::Inside);
+        painter.rect_filled(
+            Rect::from_min_size(r.min, Vec2::new(3.0, r.height())),
+            CornerRadius::ZERO,
+            ssms_colors::ACCENT,
+        );
+        let x = r.min.x + 10.0;
+        let clip = painter.with_clip_rect(r.shrink(2.0));
+        clip.text(
+            Pos2::new(x, r.min.y + 6.0),
+            egui::Align2::LEFT_TOP,
+            &op.physical_op,
+            egui::FontId::proportional(13.0),
+            ssms_colors::TEXT,
+        );
+        for (n, line) in [
+            format!("Rows: {}", op.estimate_rows),
+            format!("Cost: {}", op.estimate_cost),
+        ]
+        .iter()
+        .enumerate()
+        {
+            clip.text(
+                Pos2::new(x, r.min.y + 24.0 + n as f32 * 14.0),
+                egui::Align2::LEFT_TOP,
+                line,
+                egui::FontId::proportional(10.5),
+                ssms_colors::MUTED,
+            );
+        }
+    }
+}
 fn kind_glyph(kind: ObjectKind) -> &'static str {
     match kind {
-        ObjectKind::Server => "🖥",
-        ObjectKind::Database => "🗄",
-        ObjectKind::Schema => "📦",
-        ObjectKind::Folder => "📁",
-        ObjectKind::Table => "▦",
-        ObjectKind::View => "▤",
-        ObjectKind::Procedure => "⚙",
-        ObjectKind::Function => "ƒ",
+        ObjectKind::Server => "[S]",
+        ObjectKind::Database => "[DB]",
+        ObjectKind::Schema => "[.]",
+        ObjectKind::Folder => "[+]",
+        ObjectKind::Table => "[T]",
+        ObjectKind::View => "[V]",
+        ObjectKind::Procedure => "[P]",
+        ObjectKind::Function => "[Fn]",
+        ObjectKind::Column => "[C]",
+        ObjectKind::Index => "[Ix]",
+        ObjectKind::Synonym => "[Sy]",
+        ObjectKind::Trigger => "[Tr]",
     }
 }
 
@@ -1094,6 +1627,10 @@ fn short_type(kind: ObjectKind) -> &'static str {
         ObjectKind::Database => "Database",
         ObjectKind::Server => "Server",
         ObjectKind::Folder => "Folder",
+        ObjectKind::Column => "Column",
+        ObjectKind::Index => "Index",
+        ObjectKind::Synonym => "Synonym",
+        ObjectKind::Trigger => "Trigger",
     }
 }
 
