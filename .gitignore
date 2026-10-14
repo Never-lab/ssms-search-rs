@@ -1,0 +1,14 @@
+/target/
+/release/*.exe
+/release/*.pdb
+**/*.pdb
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+Cargo.lock.bak
