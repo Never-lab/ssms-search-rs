@@ -584,24 +584,27 @@ impl SsmsApp {
     }
 
     fn draw_tree_node(&mut self, ui: &mut egui::Ui, id: u64, depth: usize) {
-        let (name, expandable) = {
+        let (name, expandable, kind) = {
             let Some(obj) = self.catalog.by_id(id) else {
                 return;
             };
+            let kind = obj.kind;
             let expandable = matches!(
-                obj.kind,
+                kind,
                 ObjectKind::Server
                     | ObjectKind::Database
                     | ObjectKind::Folder
                     | ObjectKind::Schema
                     | ObjectKind::Table
             );
-            let name = if obj.schema.is_empty() {
-                format!("{} {}", kind_glyph(obj.kind), obj.name)
+            let name = if matches!(kind, ObjectKind::Column | ObjectKind::Index)
+                || obj.schema.is_empty()
+            {
+                format!("{} {}", kind_glyph(kind), obj.name)
             } else {
-                format!("{} {}.{}", kind_glyph(obj.kind), obj.schema, obj.name)
+                format!("{} {}.{}", kind_glyph(kind), obj.schema, obj.name)
             };
-            (name, expandable)
+            (name, expandable, kind)
         };
 
         let selected = self.selected_id == Some(id);
@@ -634,7 +637,7 @@ impl SsmsApp {
             );
             if resp.clicked() {
                 self.selected_id = Some(id);
-                if !expandable {
+                if !expandable || kind == ObjectKind::Table {
                     self.workspace = Workspace::Explorer;
                     self.explorer_tab = ExplorerTab::Properties;
                 }
