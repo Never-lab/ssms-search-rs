@@ -112,7 +112,7 @@ impl Catalog {
             "Tables",
             "",
             "",
-            format!("Server[@Name='localhost']/Database[@Name='AdventureWorks']/Table"),
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Table".into(),
         );
         for (schema, name, owner) in [
             ("HumanResources", "Employee", "dbo"),
@@ -143,7 +143,7 @@ impl Catalog {
             "Views",
             "",
             "",
-            format!("Server[@Name='localhost']/Database[@Name='AdventureWorks']/View"),
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/View".into(),
         );
         for (schema, name) in [
             ("Sales", "vSalesPerson"),
@@ -168,7 +168,7 @@ impl Catalog {
             "Stored Procedures",
             "",
             "",
-            format!("Server[@Name='localhost']/Database[@Name='AdventureWorks']/StoredProcedure"),
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/StoredProcedure".into(),
         );
         for (schema, name) in [
             ("dbo", "uspGetEmployeeManagers"),
@@ -207,9 +207,203 @@ impl Catalog {
         self.objects
             .iter()
             .filter(|o| {
-                !matches!(o.kind, ObjectKind::Server | ObjectKind::Database | ObjectKind::Folder)
+                !matches!(
+                    o.kind,
+                    ObjectKind::Server | ObjectKind::Database | ObjectKind::Folder
+                )
             })
             .filter(|o| o.matches(conditions))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::{FilterItem, FilterOperator, SearchConditions};
+
+    fn demo() -> Catalog {
+        Catalog::demo()
+    }
+
+    #[test]
+    fn object_kind_as_str_matches_smo_tokens() {
+        assert_eq!(ObjectKind::Server.as_str(), "Server");
+        assert_eq!(ObjectKind::Database.as_str(), "Database");
+        assert_eq!(ObjectKind::Schema.as_str(), "Schema");
+        assert_eq!(ObjectKind::Table.as_str(), "Table");
+        assert_eq!(ObjectKind::View.as_str(), "View");
+        assert_eq!(ObjectKind::Procedure.as_str(), "StoredProcedure");
+        assert_eq!(ObjectKind::Function.as_str(), "UserDefinedFunction");
+        assert_eq!(ObjectKind::Folder.as_str(), "Folder");
+    }
+
+    #[test]
+    fn demo_has_server_db_folders_and_leaves() {
+        let cat = demo();
+        assert!(cat.objects.len() >= 20);
+        assert!(cat.objects.iter().any(|o| o.kind == ObjectKind::Server));
+        assert!(cat.objects.iter().any(|o| o.kind == ObjectKind::Database));
+        assert!(cat.objects.iter().any(|o| o.kind == ObjectKind::Folder));
+        assert!(cat.objects.iter().any(|o| o.kind == ObjectKind::Table));
+        assert!(cat.objects.iter().any(|o| o.kind == ObjectKind::View));
+        assert!(cat.objects.iter().any(|o| o.kind == ObjectKind::Procedure));
+    }
+
+    #[test]
+    fn demo_urns_follow_smo_template() {
+        let cat = demo();
+        let server = cat
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .unwrap();
+        assert_eq!(server.urn, "Server[@Name='localhost']");
+        let table = cat
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Table && o.name == "Employee")
+            .unwrap();
+        assert!(table.urn.contains("Database[@Name='AdventureWorks']"));
+        assert!(table.urn.contains("@Name='Employee'"));
+        assert!(table.urn.contains("@Schema='HumanResources'"));
+    }
+
+    #[test]
+    fn by_id_and_children_tree_walk() {
+        let cat = demo();
+        let server = cat
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Server)
+            .unwrap();
+        assert_eq!(
+            cat.by_id(server.id).map(|o| o.name.as_str()),
+            Some("localhost")
+        );
+        assert!(cat.by_id(9_999_999).is_none());
+
+        let roots = cat.children(None);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].kind, ObjectKind::Server);
+
+        let dbs = cat.children(Some(server.id));
+        assert_eq!(dbs.len(), 1);
+        assert_eq!(dbs[0].name, "AdventureWorks");
+
+        let folders = cat.children(Some(dbs[0].id));
+        assert!(folders.iter().any(|o| o.name == "Tables"));
+        assert!(folders.iter().any(|o| o.name == "Views"));
+        assert!(folders.iter().any(|o| o.name == "Stored Procedures"));
+    }
+
+    #[test]
+    fn search_skips_server_database_folder() {
+        let cat = demo();
+        let empty = SearchConditions::default();
+        let hits = cat.search(&empty);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|o| {
+            !matches!(
+                o.kind,
+                ObjectKind::Server | ObjectKind::Database | ObjectKind::Folder
+            )
+        }));
+    }
+
+    #[test]
+    fn search_by_name_contains() {
+        let cat = demo();
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("Name", FilterOperator::Contains, "user")],
+        };
+        let hits = cat.search(&sc);
+        assert!(hits.iter().any(|o| o.name == "AspNetUsers"));
+        assert!(hits.iter().any(|o| o.name == "vw_ActiveUsers"));
+        assert!(!hits.iter().any(|o| o.name == "Product"));
+    }
+
+    #[test]
+    fn search_by_schema_equal() {
+        let cat = demo();
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("Schema", FilterOperator::Equal, "Sales")],
+        };
+        let hits = cat.search(&sc);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|o| o.schema.eq_ignore_ascii_case("Sales")));
+        assert!(hits.iter().any(|o| o.name == "Customer"));
+        assert!(hits.iter().any(|o| o.name == "uspUpdateOrder"));
+    }
+
+    #[test]
+    fn search_and_across_name_and_schema() {
+        let cat = demo();
+        let sc = SearchConditions {
+            items: vec![
+                FilterItem::new("Name", FilterOperator::StartsWith, "usp"),
+                FilterItem::new("Schema", FilterOperator::Equal, "dbo"),
+            ],
+        };
+        let hits = cat.search(&sc);
+        assert_eq!(hits.len(), 2);
+        assert!(hits
+            .iter()
+            .all(|o| o.schema == "dbo" && o.name.starts_with("usp")));
+    }
+
+    #[test]
+    fn search_type_filter_uses_smo_token() {
+        let cat = demo();
+        let sc = SearchConditions {
+            items: vec![FilterItem::new(
+                "Type",
+                FilterOperator::Equal,
+                "StoredProcedure",
+            )],
+        };
+        let hits = cat.search(&sc);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|o| o.kind == ObjectKind::Procedure));
+    }
+
+    #[test]
+    fn catalog_object_props_order() {
+        let o = CatalogObject {
+            id: 1,
+            parent_id: None,
+            kind: ObjectKind::Table,
+            name: "T".into(),
+            schema: "dbo".into(),
+            owner: "sa".into(),
+            urn: "x".into(),
+        };
+        assert_eq!(
+            o.props(),
+            [
+                ("Name", "T"),
+                ("Schema", "dbo"),
+                ("Owner", "sa"),
+                ("Type", "Table"),
+            ]
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip_catalog_object() {
+        let o = CatalogObject {
+            id: 42,
+            parent_id: Some(1),
+            kind: ObjectKind::View,
+            name: "v1".into(),
+            schema: "dbo".into(),
+            owner: "dbo".into(),
+            urn: "Server[@Name='x']".into(),
+        };
+        let json = serde_json::to_string(&o).unwrap();
+        let back: CatalogObject = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 42);
+        assert_eq!(back.kind, ObjectKind::View);
+        assert_eq!(back.urn, o.urn);
     }
 }

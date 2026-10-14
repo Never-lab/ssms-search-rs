@@ -43,6 +43,20 @@ Avvio GUI (default):
 .\release\ssms-search-rs.exe query -U sa -P '...' -d MyDb "SELECT TOP 5 name FROM sys.tables"
 ```
 
+## CI / Release (GitHub Actions)
+
+| Workflow | Trigger | Cosa fa |
+|----------|---------|---------|
+| **CI** (`.github/workflows/ci.yml`) | PR + push su `main` | `cargo fmt --check`, `clippy -D warnings`, `cargo test` (Windows) |
+| **Release** (`.github/workflows/release.yml`) | tag `v*` (o manuale) | `cargo build --release`, zip Windows, upload su GitHub Release |
+
+```powershell
+cargo test --lib
+# release da tag:
+git tag v0.5.1
+git push origin v0.5.1
+```
+
 ## Build notes
 
 - Toolchain: `stable-x86_64-pc-windows-gnu` + `D:\mingw64`

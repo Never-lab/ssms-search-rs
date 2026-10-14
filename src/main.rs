@@ -248,7 +248,7 @@ async fn run_cli(cmd: Commands) -> anyhow::Result<()> {
                     )?
                 );
             } else {
-                println!("{:<32} {:<20} {:>8} {}", "COLUMN", "TYPE", "LEN", "NULL");
+                println!("{:<32} {:<20} {:>8} NULL", "COLUMN", "TYPE", "LEN");
                 for c in cols {
                     println!(
                         "{:<32} {:<20} {:>8} {}",

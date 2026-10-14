@@ -5,8 +5,8 @@ use crate::connection::SqlClient;
 use crate::plan::{parse_showplan_operators, PlanOperator};
 use anyhow::{bail, Context, Result};
 use futures::stream::TryStreamExt;
-use tiberius::QueryItem;
 use std::time::Instant;
+use tiberius::QueryItem;
 
 #[derive(Debug, Clone)]
 pub struct DbInfo {
@@ -230,14 +230,26 @@ pub async fn describe_object(
         .collect())
 }
 
-fn assert_readonly_sql(sql: &str) -> Result<()> {
+/// Reject mutating/DDL batches used by the query helper / GUI Execute path.
+pub fn assert_readonly_sql(sql: &str) -> Result<()> {
     let upper = sql.trim().to_ascii_uppercase();
-    for banned in [
-        "INSERT ", "UPDATE ", "DELETE ", "MERGE ", "DROP ", "ALTER ", "TRUNCATE ", "EXEC ",
-        "EXECUTE ", "CREATE ", "GRANT ", "REVOKE ", "DENY ",
-    ] {
-        if upper.starts_with(banned.trim()) || upper.contains(&format!(";{banned}")) {
-            bail!("refusing mutating/DDL statement: detected '{banned}'");
+    for stmt in upper.split(';') {
+        let s = stmt.trim_start();
+        for banned in [
+            "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "TRUNCATE", "EXEC", "EXECUTE",
+            "CREATE", "GRANT", "REVOKE", "DENY",
+        ] {
+            // Require a non-identifier char after the keyword (or end) so we don't
+            // false-positive on names like "CREATED_AT" in a SELECT list mid-stmt —
+            // we only inspect statement starts.
+            if s == banned
+                || s.starts_with(&format!("{banned} "))
+                || s.starts_with(&format!("{banned}\t"))
+                || s.starts_with(&format!("{banned}\n"))
+                || s.starts_with(&format!("{banned}\r"))
+            {
+                bail!("refusing mutating/DDL statement: detected '{banned}'");
+            }
         }
     }
     Ok(())
@@ -359,7 +371,11 @@ async fn collect_query_streams(
                 result_sets += 1;
                 current_width = meta.columns().len().max(1);
                 if data_columns.is_empty() {
-                    data_columns = meta.columns().iter().map(|c| c.name().to_string()).collect();
+                    data_columns = meta
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect();
                 }
             }
             QueryItem::Row(row) => {
@@ -414,10 +430,7 @@ pub async fn object_definition(
             &[&format!("{schema}.{name}")],
         )
         .await?;
-    let row = stream
-        .into_row()
-        .await?
-        .context("no definition returned")?;
+    let row = stream.into_row().await?.context("no definition returned")?;
     match row.get::<&str, _>(0) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
         _ => bail!("no MODULE definition for {schema}.{name} (tables have no OBJECT_DEFINITION)"),
@@ -467,4 +480,123 @@ fn cell_to_string(row: &tiberius::Row, index: usize) -> String {
         return v.to_string();
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readonly_allows_select_and_with() {
+        assert!(assert_readonly_sql("SELECT 1").is_ok());
+        assert!(assert_readonly_sql("  select * from dbo.T  ").is_ok());
+        assert!(assert_readonly_sql("WITH cte AS (SELECT 1 AS n) SELECT * FROM cte").is_ok());
+        assert!(assert_readonly_sql("SET NOCOUNT ON; SELECT 1").is_ok());
+    }
+
+    #[test]
+    fn readonly_rejects_mutating_and_ddl_prefixes() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET x=1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON 1=1 WHEN MATCHED THEN UPDATE SET x=1;",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD c INT",
+            "TRUNCATE TABLE t",
+            "EXEC sp_help",
+            "EXECUTE sp_help",
+            "CREATE TABLE t(i INT)",
+            "GRANT SELECT ON t TO u",
+            "REVOKE SELECT ON t FROM u",
+            "DENY SELECT ON t TO u",
+        ] {
+            assert!(
+                assert_readonly_sql(sql).is_err(),
+                "expected reject for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_rejects_batch_after_semicolon() {
+        assert!(assert_readonly_sql("SELECT 1; DELETE FROM t").is_err());
+        assert!(assert_readonly_sql("SELECT 1;DROP TABLE t").is_err());
+        assert!(assert_readonly_sql("SELECT 1; EXEC sp_x").is_err());
+    }
+
+    #[test]
+    fn readonly_is_case_insensitive() {
+        assert!(assert_readonly_sql("insert into t values (1)").is_err());
+        assert!(assert_readonly_sql("DeLeTe FrOm t").is_err());
+    }
+
+    #[test]
+    fn escape_urn_doubles_single_quotes() {
+        assert_eq!(escape_urn("plain"), "plain");
+        assert_eq!(escape_urn("O'Brien"), "O''Brien");
+        assert_eq!(escape_urn("a'b'c"), "a''b''c");
+    }
+
+    #[test]
+    fn extract_plan_finds_showplan_cell() {
+        let result = QueryResult {
+            columns: vec!["Microsoft SQL Server 2005 XML Showplan".into()],
+            rows: vec![vec![
+                "<ShowPlanXML xmlns=\"http://schemas.microsoft.com/sqlserver/2004/07/showplan\"/>"
+                    .into(),
+            ]],
+        };
+        let xml = extract_plan_from_result(&result).unwrap();
+        assert!(xml.contains("ShowPlanXML"));
+    }
+
+    #[test]
+    fn extract_plan_scans_nested_cells() {
+        let result = QueryResult {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![
+                vec!["1".into(), "2".into()],
+                vec![
+                    "x".into(),
+                    " preamble <ShowPlanXML Version=\"1.2\"/>".into(),
+                ],
+            ],
+        };
+        assert!(extract_plan_from_result(&result).is_some());
+    }
+
+    #[test]
+    fn extract_plan_none_when_absent() {
+        let result = QueryResult {
+            columns: vec!["n".into()],
+            rows: vec![vec!["1".into()]],
+        };
+        assert!(extract_plan_from_result(&result).is_none());
+    }
+
+    #[test]
+    fn plan_mode_equality() {
+        assert_eq!(PlanMode::None, PlanMode::None);
+        assert_ne!(PlanMode::Estimated, PlanMode::Actual);
+    }
+
+    #[test]
+    fn query_execution_holds_parsed_operators() {
+        let xml = r#"<ShowPlanXML><RelOp NodeId="0" PhysicalOp="Select" LogicalOp="Select" EstimateRows="1" EstimatedTotalSubtreeCost="0"/></ShowPlanXML>"#;
+        let ops = parse_showplan_operators(xml);
+        let exec = QueryExecution {
+            result: QueryResult {
+                columns: vec![],
+                rows: vec![],
+            },
+            messages: vec!["ok".into()],
+            plan_xml: Some(xml.into()),
+            plan_operators: ops,
+            elapsed_ms: 12,
+        };
+        assert_eq!(exec.plan_operators.len(), 1);
+        assert_eq!(exec.elapsed_ms, 12);
+        assert_eq!(exec.messages[0], "ok");
+    }
 }

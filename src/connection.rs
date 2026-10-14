@@ -72,7 +72,8 @@ impl ConnectArgs {
     }
 }
 
-fn parse_server_host_port(server: &str, default_port: u16) -> (String, u16) {
+/// Parse `host`, `host,port`, `host:port`, or `host\instance` (instance keeps default port).
+pub fn parse_server_host_port(server: &str, default_port: u16) -> (String, u16) {
     // host,port
     if let Some((h, p)) = server.rsplit_once(',') {
         if let Ok(port) = p.trim().parse::<u16>() {
@@ -115,4 +116,94 @@ pub async fn ping(client: &mut SqlClient) -> Result<(String, String, String)> {
     let db: String = row.get::<&str, _>(1).unwrap_or("?").to_string();
     let login: String = row.get::<&str, _>(2).unwrap_or("?").to_string();
     Ok((server, db, login))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(server: &str, port: u16, user: Option<&str>, password: Option<&str>) -> ConnectArgs {
+        ConnectArgs {
+            server: server.into(),
+            port,
+            database: "master".into(),
+            user: user.map(str::to_string),
+            password: password.map(str::to_string),
+            trust_cert: true,
+            app_name: "ssms-search-rs-test".into(),
+        }
+    }
+
+    #[test]
+    fn parse_plain_host_uses_default_port() {
+        assert_eq!(
+            parse_server_host_port("localhost", 1433),
+            ("localhost".into(), 1433)
+        );
+        assert_eq!(
+            parse_server_host_port("sql.example.com", 1434),
+            ("sql.example.com".into(), 1434)
+        );
+    }
+
+    #[test]
+    fn parse_host_comma_port() {
+        assert_eq!(
+            parse_server_host_port("db.local,14333", 1433),
+            ("db.local".into(), 14333)
+        );
+        assert_eq!(
+            parse_server_host_port("  10.0.0.5 , 1500 ", 1433),
+            ("10.0.0.5".into(), 1500)
+        );
+    }
+
+    #[test]
+    fn parse_host_colon_port() {
+        assert_eq!(
+            parse_server_host_port("127.0.0.1:1433", 99),
+            ("127.0.0.1".into(), 1433)
+        );
+    }
+
+    #[test]
+    fn parse_named_instance_keeps_default_port() {
+        // backslash instance must not be split on ':' inside future forms; comma still wins
+        assert_eq!(
+            parse_server_host_port(r"HOST\SQLEXPRESS", 1433),
+            (r"HOST\SQLEXPRESS".into(), 1433)
+        );
+        assert_eq!(
+            parse_server_host_port(r"HOST\SQLEXPRESS,1435", 1433),
+            (r"HOST\SQLEXPRESS".into(), 1435)
+        );
+    }
+
+    #[test]
+    fn parse_invalid_port_suffix_falls_back() {
+        assert_eq!(
+            parse_server_host_port("host,notaport", 1433),
+            ("host,notaport".into(), 1433)
+        );
+        assert_eq!(
+            parse_server_host_port("host:notaport", 1433),
+            ("host:notaport".into(), 1433)
+        );
+    }
+
+    #[test]
+    fn to_config_requires_both_user_and_password() {
+        let only_user = args("localhost", 1433, Some("sa"), None);
+        assert!(only_user.to_config().is_err());
+        let only_pw = args("localhost", 1433, None, Some("x"));
+        assert!(only_pw.to_config().is_err());
+        let none = args("localhost", 1433, None, None);
+        assert!(none.to_config().is_err());
+    }
+
+    #[test]
+    fn to_config_accepts_sql_auth() {
+        let ok = args("sql.lab,14333", 1433, Some("sa"), Some("secret"));
+        assert!(ok.to_config().is_ok());
+    }
 }

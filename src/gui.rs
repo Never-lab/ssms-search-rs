@@ -1,7 +1,9 @@
 //! Desktop UI (egui) — SSMS-inspired Object Explorer + Query / Execution Plan.
 
 use anyhow::Context;
-use eframe::egui::{self, Color32, CornerRadius, Frame, Key, Margin, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{
+    self, Color32, CornerRadius, Frame, Key, Margin, RichText, Sense, Stroke, Vec2,
+};
 use ssms_search_rs::connection::{connect, ping, ConnectArgs};
 use ssms_search_rs::filter::{FilterItem, FilterOperator, SearchConditions};
 use ssms_search_rs::functions::{self, PlanMode, QueryExecution, QueryResult};
@@ -222,8 +224,7 @@ impl SsmsApp {
             rt.block_on(async {
                 let mut client = connect(&args).await?;
                 let (server, db, login) = ping(&mut client).await?;
-                let catalog =
-                    functions::load_catalog(&mut client, &server, &args.database).await?;
+                let catalog = functions::load_catalog(&mut client, &server, &args.database).await?;
                 Ok::<_, anyhow::Error>((catalog, server, db, login))
             })
         });
@@ -405,7 +406,9 @@ impl SsmsApp {
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
-                .add(egui::Button::new(RichText::new("⚡ Connect").color(ssms_colors::ACCENT)))
+                .add(egui::Button::new(
+                    RichText::new("⚡ Connect").color(ssms_colors::ACCENT),
+                ))
                 .clicked()
             {
                 self.show_connect = true;
@@ -558,7 +561,11 @@ impl SsmsApp {
                 ExplorerTab::ObjectExplorerDetails,
                 "Object Explorer Details",
             );
-            ui.selectable_value(&mut self.explorer_tab, ExplorerTab::Properties, "Properties");
+            ui.selectable_value(
+                &mut self.explorer_tab,
+                ExplorerTab::Properties,
+                "Properties",
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("New Query").clicked() {
                     self.new_query();
@@ -675,10 +682,7 @@ impl SsmsApp {
                 let q = if o.schema.is_empty() {
                     format!("SELECT TOP (100) *\nFROM [{}];\n", o.name)
                 } else {
-                    format!(
-                        "SELECT TOP (100) *\nFROM [{}].[{}];\n",
-                        o.schema, o.name
-                    )
+                    format!("SELECT TOP (100) *\nFROM [{}].[{}];\n", o.schema, o.name)
                 };
                 self.sql_text = q;
                 self.new_query();
@@ -841,9 +845,11 @@ impl SsmsApp {
         if let Some(xml) = &self.plan_xml {
             ui.add_space(6.0);
             ui.collapsing("Raw ShowPlanXML", |ui| {
-                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                    ui.monospace(xml);
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        ui.monospace(xml);
+                    });
             });
         }
     }

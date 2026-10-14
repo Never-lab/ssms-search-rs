@@ -75,7 +75,11 @@ pub struct FilterItem {
 }
 
 impl FilterItem {
-    pub fn new(column: impl Into<String>, operator: FilterOperator, value: impl Into<String>) -> Self {
+    pub fn new(
+        column: impl Into<String>,
+        operator: FilterOperator,
+        value: impl Into<String>,
+    ) -> Self {
         Self {
             column: column.into(),
             operator,
@@ -142,10 +146,145 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contains_and_startswith() {
-        let c = FilterItem::new("Name", FilterOperator::Contains, "user");
-        assert!(c.matches_text("AspNetUsers"));
+    fn operator_all_has_eleven_ssms_tokens_in_order() {
+        let names: Vec<_> = FilterOperator::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Equal",
+                "NotEqual",
+                "StartsWith",
+                "Contains",
+                "NotContains",
+                "LessThan",
+                "LessThanEqual",
+                "GreaterThan",
+                "GreaterThanEqual",
+                "Between",
+                "NotBetween",
+            ]
+        );
+    }
+
+    #[test]
+    fn next_cycles_full_ring() {
+        let mut op = FilterOperator::Equal;
+        let mut seen = vec![op];
+        for _ in 0..10 {
+            op = op.next();
+            seen.push(op);
+        }
+        assert_eq!(seen.len(), 11);
+        assert_eq!(op.next(), FilterOperator::Equal);
+        assert_eq!(seen[3], FilterOperator::Contains);
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        for op in FilterOperator::ALL {
+            assert_eq!(format!("{op}"), op.as_str());
+        }
+    }
+
+    #[test]
+    fn equal_and_not_equal_case_insensitive() {
+        let eq = FilterItem::new("Name", FilterOperator::Equal, "Foo");
+        assert!(eq.matches_text("foo"));
+        assert!(eq.matches_text("FOO"));
+        assert!(!eq.matches_text("food"));
+        let ne = FilterItem::new("Name", FilterOperator::NotEqual, "Foo");
+        assert!(ne.matches_text("bar"));
+        assert!(!ne.matches_text("FOO"));
+    }
+
+    #[test]
+    fn starts_contains_not_contains() {
         let s = FilterItem::new("Name", FilterOperator::StartsWith, "asp");
         assert!(s.matches_text("AspNetUsers"));
+        assert!(!s.matches_text("NetAsp"));
+        let c = FilterItem::new("Name", FilterOperator::Contains, "user");
+        assert!(c.matches_text("AspNetUsers"));
+        let nc = FilterItem::new("Name", FilterOperator::NotContains, "user");
+        assert!(!nc.matches_text("AspNetUsers"));
+        assert!(nc.matches_text("Product"));
+    }
+
+    #[test]
+    fn lexicographic_comparisons() {
+        let lt = FilterItem::new("Name", FilterOperator::LessThan, "m");
+        assert!(lt.matches_text("abc"));
+        assert!(!lt.matches_text("xyz"));
+        let lte = FilterItem::new("Name", FilterOperator::LessThanEqual, "m");
+        assert!(lte.matches_text("m"));
+        let gt = FilterItem::new("Name", FilterOperator::GreaterThan, "m");
+        assert!(gt.matches_text("z"));
+        let gte = FilterItem::new("Name", FilterOperator::GreaterThanEqual, "m");
+        assert!(gte.matches_text("m"));
+    }
+
+    #[test]
+    fn between_and_not_between() {
+        let mut b = FilterItem::new("Name", FilterOperator::Between, "a");
+        b.value2 = "c".into();
+        assert!(b.matches_text("b"));
+        assert!(b.matches_text("a"));
+        assert!(b.matches_text("c"));
+        assert!(!b.matches_text("d"));
+        let mut nb = FilterItem::new("Name", FilterOperator::NotBetween, "a");
+        nb.value2 = "c".into();
+        assert!(nb.matches_text("d"));
+        assert!(!nb.matches_text("b"));
+    }
+
+    #[test]
+    fn search_conditions_empty_when_no_values() {
+        let mut sc = SearchConditions::default();
+        assert!(sc.is_empty());
+        sc.items
+            .push(FilterItem::new("Name", FilterOperator::Contains, ""));
+        assert!(sc.is_empty());
+        sc.items[0].value = "x".into();
+        assert!(!sc.is_empty());
+        sc.clear();
+        assert!(sc.is_empty());
+    }
+
+    #[test]
+    fn search_conditions_and_semantics() {
+        let sc = SearchConditions {
+            items: vec![
+                FilterItem::new("Name", FilterOperator::Contains, "user"),
+                FilterItem::new("Schema", FilterOperator::Equal, "dbo"),
+            ],
+        };
+        assert!(sc.matches(&[("Name", "AspNetUsers"), ("Schema", "dbo")]));
+        assert!(!sc.matches(&[("Name", "AspNetUsers"), ("Schema", "Sales")]));
+        assert!(!sc.matches(&[("Name", "Product"), ("Schema", "dbo")]));
+    }
+
+    #[test]
+    fn search_conditions_column_match_is_case_insensitive() {
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("name", FilterOperator::Equal, "x")],
+        };
+        assert!(sc.matches(&[("NAME", "x")]));
+    }
+
+    #[test]
+    fn missing_column_fails_non_empty_filter() {
+        let sc = SearchConditions {
+            items: vec![FilterItem::new("Owner", FilterOperator::Equal, "sa")],
+        };
+        assert!(!sc.matches(&[("Name", "t")]));
+    }
+
+    #[test]
+    fn serde_roundtrip_filter_item() {
+        let item = FilterItem::new("Schema", FilterOperator::StartsWith, "Hu");
+        let json = serde_json::to_string(&item).unwrap();
+        let back: FilterItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.column, "Schema");
+        assert_eq!(back.operator, FilterOperator::StartsWith);
+        assert_eq!(back.value, "Hu");
     }
 }
