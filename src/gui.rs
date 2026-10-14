@@ -2,12 +2,13 @@
 
 use anyhow::Context;
 use eframe::egui::{
-    self, Color32, CornerRadius, Frame, Key, Margin, RichText, Sense, Stroke, Vec2,
+    self, Color32, CornerRadius, Frame, Key, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
 };
 use ssms_search_rs::connection::{connect, ping, ConnectArgs};
 use ssms_search_rs::filter::{FilterItem, FilterOperator, SearchConditions};
 use ssms_search_rs::functions::{self, ColumnInfo, PlanMode, QueryExecution, QueryResult};
 use ssms_search_rs::plan::PlanOperator;
+use ssms_search_rs::plan_children;
 use ssms_search_rs::{Catalog, CatalogObject, ObjectKind};
 use std::collections::HashSet;
 
@@ -481,14 +482,14 @@ impl SsmsApp {
         ui.horizontal(|ui| {
             if ui
                 .add(egui::Button::new(
-                    RichText::new("⚡ Connect").color(ssms_colors::ACCENT),
+                    RichText::new("Connect").color(ssms_colors::ACCENT),
                 ))
                 .clicked()
             {
                 self.show_connect = true;
             }
             if ui
-                .add_enabled(self.connected, egui::Button::new("🔄 Refresh"))
+                .add_enabled(self.connected, egui::Button::new("Refresh"))
                 .on_hover_text("Reload databases and objects (no reconnect dialog)")
                 .clicked()
             {
@@ -496,14 +497,14 @@ impl SsmsApp {
             }
             ui.separator();
             if ui
-                .add(egui::Button::new(RichText::new("🗒 New Query").strong()))
+                .add(egui::Button::new(RichText::new("New Query").strong()))
                 .on_hover_text("Open SQL editor")
                 .clicked()
             {
                 self.new_query();
             }
             let exec_btn = ui.add(
-                egui::Button::new(RichText::new("▶ Execute").color(Color32::WHITE))
+                egui::Button::new(RichText::new("Execute").color(Color32::WHITE))
                     .fill(ssms_colors::EXEC),
             );
             if exec_btn.on_hover_text("Execute (F5)").clicked() {
@@ -515,7 +516,7 @@ impl SsmsApp {
                 self.execute_query(mode);
             }
             if ui
-                .button("📈 Estimated Plan")
+                .button("Estimated Plan")
                 .on_hover_text("SET SHOWPLAN_XML — does not run the query")
                 .clicked()
             {
@@ -525,7 +526,7 @@ impl SsmsApp {
             ui.separator();
             if ui
                 .add(egui::Button::new(
-                    RichText::new("🔍 Filter").color(ssms_colors::TITLE),
+                    RichText::new("Filter").color(ssms_colors::TITLE),
                 ))
                 .clicked()
             {
@@ -541,7 +542,13 @@ impl SsmsApp {
         ui.label(
             RichText::new("Object Explorer")
                 .color(ssms_colors::TITLE)
-                .strong(),
+                .strong()
+                .size(15.0),
+        );
+        ui.label(
+            RichText::new(&self.connection_label)
+                .color(ssms_colors::MUTED)
+                .small(),
         );
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -825,43 +832,56 @@ impl SsmsApp {
         let selected = self.selected_id == Some(id);
         let open = self.expanded.contains(&id);
 
-        ui.horizontal(|ui| {
-            ui.add_space((depth as f32) * 14.0);
-            if expandable {
-                let twisty = if open { "▼" } else { "▶" };
-                if ui.add(egui::Button::new(twisty).frame(false)).clicked() {
-                    self.toggle_node(id, open);
-                }
-            } else {
-                ui.add_space(18.0);
-            }
-
-            let text = if selected {
-                RichText::new(name).strong()
-            } else {
-                RichText::new(name)
-            };
-            let resp = ui.add(
-                egui::Button::new(text)
-                    .fill(if selected {
-                        ssms_colors::SEL
-                    } else {
-                        Color32::TRANSPARENT
-                    })
-                    .frame(selected),
+        let (rect, resp) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 20.0),
+            Sense::click(),
+        );
+        let fill = if selected {
+            ssms_colors::SEL
+        } else if resp.hovered() {
+            ssms_colors::CHROME
+        } else {
+            Color32::TRANSPARENT
+        };
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, fill);
+        let x0 = rect.left() + 4.0 + depth as f32 * 16.0;
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        if expandable {
+            painter.text(
+                Pos2::new(x0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                if open { "v" } else { ">" },
+                font.clone(),
+                ssms_colors::MUTED,
             );
-            if resp.clicked() {
+        }
+        let label_x = x0 + 16.0;
+        painter.text(
+            Pos2::new(label_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            font,
+            ssms_colors::TEXT,
+        );
+
+        let on_twisty = resp
+            .interact_pointer_pos()
+            .is_some_and(|p| p.x < label_x);
+        if resp.clicked() {
+            if expandable && on_twisty {
+                self.toggle_node(id, open);
+            } else {
                 self.selected_id = Some(id);
                 if !expandable || kind == ObjectKind::Table {
                     self.workspace = Workspace::Explorer;
                     self.explorer_tab = ExplorerTab::Properties;
                 }
             }
-            if resp.double_clicked() && expandable {
-                self.toggle_node(id, open);
-            }
-        });
-
+        }
+        if resp.double_clicked() && expandable && !on_twisty {
+            self.toggle_node(id, open);
+        }
         if expandable && self.expanded.contains(&id) {
             let children: Vec<u64> = self
                 .catalog
@@ -923,13 +943,12 @@ impl SsmsApp {
             egui::Grid::new("results_grid")
                 .striped(true)
                 .num_columns(5)
-                .min_col_width(80.0)
+                .min_col_width(56.0)
+                .spacing([10.0, 2.0])
                 .show(ui, |ui| {
-                    ui.strong("Type");
-                    ui.strong("Name");
-                    ui.strong("Schema");
-                    ui.strong("Database");
-                    ui.strong("Owner");
+                    for h in ["Type", "Name", "Schema", "Database", "Owner"] {
+                        ui.label(RichText::new(h).strong().color(ssms_colors::TITLE));
+                    }
                     ui.end_row();
 
                     let rows: Vec<(u64, String, String, String, String, String)> = self
@@ -1065,7 +1084,7 @@ impl SsmsApp {
     fn draw_query_workspace(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!(" 🗒 {} ", self.query_tab_title))
+                RichText::new(&self.query_tab_title)
                     .color(ssms_colors::TITLE)
                     .strong(),
             );
@@ -1079,30 +1098,52 @@ impl SsmsApp {
         ui.separator();
 
         let total = ui.available_height();
-        let editor_h = (total * 0.45).clamp(140.0, 360.0);
+        let editor_h = (total * 0.50).clamp(180.0, 420.0);
 
-        egui::ScrollArea::vertical()
-            .id_salt("sql_editor_scroll")
-            .max_height(editor_h)
+        Frame::new()
+            .fill(ssms_colors::PANEL)
+            .stroke(Stroke::new(1.0_f32, ssms_colors::BORDER))
+            .inner_margin(Margin::same(4))
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.sql_text)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(12)
-                        .font(egui::TextStyle::Monospace),
-                );
+                egui::ScrollArea::vertical()
+                    .id_salt("sql_editor_scroll")
+                    .max_height(editor_h)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.sql_text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(12)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
             });
 
-        ui.separator();
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.query_bottom, QueryBottomTab::Results, "Results");
-            ui.selectable_value(&mut self.query_bottom, QueryBottomTab::Messages, "Messages");
-            ui.selectable_value(
-                &mut self.query_bottom,
-                QueryBottomTab::ExecutionPlan,
-                "Execution Plan",
-            );
+            for (tab, label) in [
+                (QueryBottomTab::Results, "Results"),
+                (QueryBottomTab::Messages, "Messages"),
+                (QueryBottomTab::ExecutionPlan, "Execution Plan"),
+            ] {
+                let active = self.query_bottom == tab;
+                let text = if active {
+                    RichText::new(label).strong().color(ssms_colors::TEXT)
+                } else {
+                    RichText::new(label).color(ssms_colors::MUTED)
+                };
+                let resp = ui.add(egui::Button::new(text).frame(false));
+                if active {
+                    let y = resp.rect.bottom() + 1.0;
+                    ui.painter().line_segment(
+                        [Pos2::new(resp.rect.left(), y), Pos2::new(resp.rect.right(), y)],
+                        Stroke::new(2.0_f32, ssms_colors::ACCENT),
+                    );
+                }
+                if resp.clicked() {
+                    self.query_bottom = tab;
+                }
+            }
         });
         ui.separator();
 
@@ -1133,10 +1174,11 @@ impl SsmsApp {
             egui::Grid::new("query_result_grid")
                 .striped(true)
                 .num_columns(cols.len().max(1))
-                .min_col_width(72.0)
+                .min_col_width(56.0)
+                .spacing([10.0, 2.0])
                 .show(ui, |ui| {
                     for c in &cols {
-                        ui.strong(c);
+                        ui.label(RichText::new(c).strong().color(ssms_colors::TITLE));
                     }
                     if !cols.is_empty() {
                         ui.end_row();
@@ -1161,11 +1203,10 @@ impl SsmsApp {
                 );
             }
             for msg in &self.query_messages {
-                ui.monospace(msg);
+                ui.label(RichText::new(msg).monospace());
             }
         });
     }
-
     fn draw_execution_plan(&mut self, ui: &mut egui::Ui) {
         if self.plan_operators.is_empty() {
             ui.label(
@@ -1186,32 +1227,49 @@ impl SsmsApp {
             .small(),
         );
         let ops = self.plan_operators.clone();
-        egui::ScrollArea::both().show(ui, |ui| {
-            egui::Grid::new("plan_grid")
-                .striped(true)
-                .num_columns(5)
-                .min_col_width(70.0)
-                .show(ui, |ui| {
-                    ui.strong("NodeId");
-                    ui.strong("Physical Op");
-                    ui.strong("Logical Op");
-                    ui.strong("Est. Rows");
-                    ui.strong("Subtree Cost");
-                    ui.end_row();
-                    for op in &ops {
-                        ui.label(&op.node_id);
-                        ui.label(&op.physical_op);
-                        ui.label(&op.logical_op);
-                        ui.label(&op.estimate_rows);
-                        ui.label(&op.estimate_cost);
-                        ui.end_row();
-                    }
-                });
-        });
+        egui::ScrollArea::both()
+            .id_salt("plan_graph_scroll")
+            .max_height(ui.available_height() * 0.6)
+            .show(ui, |ui| draw_plan_graph(ui, &ops));
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Operator list")
+            .default_open(ops.len() <= 12)
+            .show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("plan_grid_scroll")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("plan_grid")
+                            .striped(true)
+                            .num_columns(5)
+                            .min_col_width(70.0)
+                            .show(ui, |ui| {
+                                for h in [
+                                    "NodeId",
+                                    "Physical Op",
+                                    "Logical Op",
+                                    "Est. Rows",
+                                    "Subtree Cost",
+                                ] {
+                                    ui.strong(h);
+                                }
+                                ui.end_row();
+                                for op in &ops {
+                                    ui.label(&op.node_id);
+                                    ui.label(&op.physical_op);
+                                    ui.label(&op.logical_op);
+                                    ui.label(&op.estimate_rows);
+                                    ui.label(&op.estimate_cost);
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
         if let Some(xml) = &self.plan_xml {
             ui.add_space(6.0);
             ui.collapsing("Raw ShowPlanXML", |ui| {
                 egui::ScrollArea::vertical()
+                    .id_salt("plan_xml_scroll")
                     .max_height(160.0)
                     .show(ui, |ui| {
                         ui.monospace(xml);
@@ -1219,7 +1277,6 @@ impl SsmsApp {
             });
         }
     }
-
     fn draw_status(&self, ui: &mut egui::Ui) {
         ui.label(RichText::new(&self.status).color(Color32::WHITE));
     }
@@ -1437,20 +1494,99 @@ impl eframe::App for SsmsApp {
     }
 }
 
+const PLAN_BOX: Vec2 = Vec2::new(150.0, 56.0);
+const PLAN_GAP_X: f32 = 36.0;
+const PLAN_GAP_Y: f32 = 12.0;
+const PLAN_PAD: f32 = 12.0;
+
+/// Left-to-right tree layout: leaves get sequential rows, parents centre on their children.
+fn layout_plan(kids: &[Vec<usize>], i: usize, depth: usize, next_row: &mut f32, pos: &mut [Pos2]) {
+    for &c in &kids[i] {
+        layout_plan(kids, c, depth + 1, next_row, pos);
+    }
+    let y = if kids[i].is_empty() {
+        let y = *next_row;
+        *next_row += PLAN_BOX.y + PLAN_GAP_Y;
+        y
+    } else {
+        let (first, last) = (kids[i][0], *kids[i].last().unwrap());
+        (pos[first].y + pos[last].y) / 2.0
+    };
+    pos[i] = Pos2::new(depth as f32 * (PLAN_BOX.x + PLAN_GAP_X), y);
+}
+
+fn draw_plan_graph(ui: &mut egui::Ui, ops: &[PlanOperator]) {
+    let kids = plan_children(ops);
+    let mut pos = vec![Pos2::ZERO; ops.len()];
+    let mut next_row = 0.0;
+    for (i, op) in ops.iter().enumerate() {
+        if op.parent.is_none() {
+            layout_plan(&kids, i, 0, &mut next_row, &mut pos);
+        }
+    }
+    let size = pos.iter().fold(Vec2::ZERO, |m, p| {
+        Vec2::new(m.x.max(p.x + PLAN_BOX.x), m.y.max(p.y + PLAN_BOX.y))
+    }) + Vec2::splat(PLAN_PAD * 2.0);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let origin = rect.min + Vec2::splat(PLAN_PAD);
+    let painter = ui.painter_at(rect);
+    let edge = Stroke::new(1.0_f32, ssms_colors::BORDER);
+    let box_at = |i: usize| Rect::from_min_size(origin + pos[i].to_vec2(), PLAN_BOX);
+
+    for (p, cs) in kids.iter().enumerate() {
+        for &c in cs {
+            painter.line_segment([box_at(p).right_center(), box_at(c).left_center()], edge);
+        }
+    }
+    for (i, op) in ops.iter().enumerate() {
+        let r = box_at(i);
+        painter.rect_filled(r, CornerRadius::same(3), Color32::WHITE);
+        painter.rect_stroke(r, CornerRadius::same(3), edge, egui::StrokeKind::Inside);
+        painter.rect_filled(
+            Rect::from_min_size(r.min, Vec2::new(3.0, r.height())),
+            CornerRadius::ZERO,
+            ssms_colors::ACCENT,
+        );
+        let x = r.min.x + 10.0;
+        let clip = painter.with_clip_rect(r.shrink(2.0));
+        clip.text(
+            Pos2::new(x, r.min.y + 6.0),
+            egui::Align2::LEFT_TOP,
+            &op.physical_op,
+            egui::FontId::proportional(13.0),
+            ssms_colors::TEXT,
+        );
+        for (n, line) in [
+            format!("Rows: {}", op.estimate_rows),
+            format!("Cost: {}", op.estimate_cost),
+        ]
+        .iter()
+        .enumerate()
+        {
+            clip.text(
+                Pos2::new(x, r.min.y + 24.0 + n as f32 * 14.0),
+                egui::Align2::LEFT_TOP,
+                line,
+                egui::FontId::proportional(10.5),
+                ssms_colors::MUTED,
+            );
+        }
+    }
+}
 fn kind_glyph(kind: ObjectKind) -> &'static str {
     match kind {
-        ObjectKind::Server => "🖥",
-        ObjectKind::Database => "🗄",
-        ObjectKind::Schema => "📦",
-        ObjectKind::Folder => "📁",
-        ObjectKind::Table => "▦",
-        ObjectKind::View => "▤",
-        ObjectKind::Procedure => "⚙",
-        ObjectKind::Function => "ƒ",
-        ObjectKind::Column => "▤",
-        ObjectKind::Index => "⌗",
-        ObjectKind::Synonym => "⇄",
-        ObjectKind::Trigger => "⚡",
+        ObjectKind::Server => "[S]",
+        ObjectKind::Database => "[DB]",
+        ObjectKind::Schema => "[.]",
+        ObjectKind::Folder => "[+]",
+        ObjectKind::Table => "[T]",
+        ObjectKind::View => "[V]",
+        ObjectKind::Procedure => "[P]",
+        ObjectKind::Function => "[Fn]",
+        ObjectKind::Column => "[C]",
+        ObjectKind::Index => "[Ix]",
+        ObjectKind::Synonym => "[Sy]",
+        ObjectKind::Trigger => "[Tr]",
     }
 }
 
