@@ -1,9 +1,7 @@
 //! Dedicated SQL worker: one Tokio runtime + optional live `SqlClient` (GUI session).
 
 use anyhow::{Context, Result};
-use ssms_search_rs::connection::{
-    connect, is_connection_error, ping, ConnectArgs, SqlClient,
-};
+use ssms_search_rs::connection::{connect, is_connection_error, ping, ConnectArgs, SqlClient};
 use ssms_search_rs::functions::{self, ColumnInfo, PlanMode, QueryExecution};
 use ssms_search_rs::{Catalog, CatalogObject};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -193,9 +191,18 @@ async fn handle_command(
             idx_id,
             start_id,
         } => {
-            let result =
-                run_load_table_children(client, session, &database, &server, &schema, &table_name, cols_id, idx_id, start_id)
-                    .await;
+            let result = run_load_table_children(
+                client,
+                session,
+                &database,
+                &server,
+                &schema,
+                &table_name,
+                cols_id,
+                idx_id,
+                start_id,
+            )
+            .await;
             SqlResponse::LoadTableChildren {
                 cols_id,
                 idx_id,

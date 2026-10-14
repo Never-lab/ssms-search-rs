@@ -244,10 +244,7 @@ impl SsmsApp {
                     i.operator,
                     FilterOperator::Between | FilterOperator::NotBetween
                 ) {
-                    format!(
-                        "{} {} '{}'..'{}'",
-                        i.column, i.operator, i.value, i.value2
-                    )
+                    format!("{} {} '{}'..'{}'", i.column, i.operator, i.value, i.value2)
                 } else {
                     format!("{} {} '{}'", i.column, i.operator, i.value)
                 }
@@ -739,7 +736,10 @@ impl SsmsApp {
 
     /// Populate a live Database node the first time it is expanded.
     fn load_database_children(&mut self, db_id: u64) {
-        if self.is_demo || !self.connected || self.sql_pending || self.loaded_databases.contains(&db_id)
+        if self.is_demo
+            || !self.connected
+            || self.sql_pending
+            || self.loaded_databases.contains(&db_id)
         {
             return;
         }
@@ -910,10 +910,8 @@ impl SsmsApp {
         let selected = self.selected_id == Some(id);
         let open = self.expanded.contains(&id);
 
-        let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), 20.0),
-            Sense::click(),
-        );
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::click());
         let fill = if selected {
             ssms_colors::SEL
         } else if resp.hovered() {
@@ -943,9 +941,7 @@ impl SsmsApp {
             ssms_colors::TEXT,
         );
 
-        let on_twisty = resp
-            .interact_pointer_pos()
-            .is_some_and(|p| p.x < label_x);
+        let on_twisty = resp.interact_pointer_pos().is_some_and(|p| p.x < label_x);
         if resp.clicked() {
             if expandable && on_twisty {
                 self.toggle_node(id, open);
@@ -1207,7 +1203,10 @@ impl SsmsApp {
                 if active {
                     let y = resp.rect.bottom() + 1.0;
                     ui.painter().line_segment(
-                        [Pos2::new(resp.rect.left(), y), Pos2::new(resp.rect.right(), y)],
+                        [
+                            Pos2::new(resp.rect.left(), y),
+                            Pos2::new(resp.rect.right(), y),
+                        ],
                         Stroke::new(2.0_f32, ssms_colors::ACCENT),
                     );
                 }
@@ -1439,10 +1438,8 @@ impl SsmsApp {
                     if ui
                         .add_enabled(
                             !self.sql_pending,
-                            egui::Button::new(
-                                RichText::new(connect_label).color(Color32::WHITE),
-                            )
-                            .fill(ssms_colors::ACCENT),
+                            egui::Button::new(RichText::new(connect_label).color(Color32::WHITE))
+                                .fill(ssms_colors::ACCENT),
                         )
                         .clicked()
                     {
@@ -1469,8 +1466,10 @@ impl SsmsApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Filter the list of objects shown under the selected node (AND).")
-                        .color(ssms_colors::MUTED),
+                    RichText::new(
+                        "Filter the list of objects shown under the selected node (AND).",
+                    )
+                    .color(ssms_colors::MUTED),
                 );
                 ui.add_space(8.0);
                 let mut remove_at: Option<usize> = None;
@@ -1542,11 +1541,8 @@ impl SsmsApp {
                 }
                 ui.add_space(8.0);
                 if ui.button("Add").clicked() {
-                    self.filter_draft.push(FilterItem::new(
-                        "Name",
-                        FilterOperator::Contains,
-                        "",
-                    ));
+                    self.filter_draft
+                        .push(FilterItem::new("Name", FilterOperator::Contains, ""));
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
