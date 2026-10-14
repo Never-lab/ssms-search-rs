@@ -53,7 +53,8 @@ pub fn parse_showplan_operators(xml: &str) -> Vec<PlanOperator> {
             let slice = &rest[rel..];
             let end = slice.find('>').unwrap_or(slice.len().min(800));
             let tag = &slice[..end];
-            let self_closing = tag.ends_with('/') || slice.get(..end + 1).is_some_and(|s| s.ends_with("/>"));
+            let self_closing =
+                tag.ends_with('/') || slice.get(..end + 1).is_some_and(|s| s.ends_with("/>"));
             let parent = stack.last().copied();
             let idx = out.len();
             out.push(PlanOperator {

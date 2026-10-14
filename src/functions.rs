@@ -270,8 +270,8 @@ async fn populate_database(
     database: &str,
     db_id: u64,
 ) -> Result<()> {
-    let _span = crate::trace::Span::new("engine.populate_database")
-        .detail(format!("{server}/{database}"));
+    let _span =
+        crate::trace::Span::new("engine.populate_database").detail(format!("{server}/{database}"));
     use_database(client, database).await?;
 
     let q = "\
@@ -618,7 +618,10 @@ pub async fn run_query_ex(
     };
     crate::trace::timed_result(
         "engine.run_query_ex",
-        format!("plan={plan_label} max_rows={max_rows} bytes={}", trimmed.len()),
+        format!(
+            "plan={plan_label} max_rows={max_rows} bytes={}",
+            trimmed.len()
+        ),
         async {
             let mut messages = Vec::new();
             let started = Instant::now();

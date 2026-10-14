@@ -31,11 +31,17 @@ pub fn format_report() -> String {
         return "No engine trace events yet.".into();
     }
     let mut lines = Vec::with_capacity(events.len() + 2);
-    lines.push(format!("Engine trace ({} event(s), newest last):", events.len()));
+    lines.push(format!(
+        "Engine trace ({} event(s), newest last):",
+        events.len()
+    ));
     for e in &events {
         let status = if e.ok { "ok" } else { "ERR" };
         if e.detail.is_empty() {
-            lines.push(format!("  [{:>6} ms] {:<28} {status}", e.elapsed_ms, e.name));
+            lines.push(format!(
+                "  [{:>6} ms] {:<28} {status}",
+                e.elapsed_ms, e.name
+            ));
         } else {
             lines.push(format!(
                 "  [{:>6} ms] {:<28} {status}  {}",
@@ -152,7 +158,9 @@ mod tests {
         let s = Span::new("test.span").detail("x");
         s.finish();
         let snap = snapshot();
-        assert!(snap.iter().any(|e| e.name == "test.span" && e.detail == "x" && e.ok));
+        assert!(snap
+            .iter()
+            .any(|e| e.name == "test.span" && e.detail == "x" && e.ok));
         let report = format_report();
         assert!(report.contains("test.span"));
         clear();
