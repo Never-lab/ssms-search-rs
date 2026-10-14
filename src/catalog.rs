@@ -16,6 +16,10 @@ pub enum ObjectKind {
     Procedure,
     Function,
     Folder,
+    Column,
+    Index,
+    Synonym,
+    Trigger,
 }
 
 impl ObjectKind {
@@ -29,6 +33,10 @@ impl ObjectKind {
             Self::Procedure => "StoredProcedure",
             Self::Function => "UserDefinedFunction",
             Self::Folder => "Folder",
+            Self::Column => "Column",
+            Self::Index => "Index",
+            Self::Synonym => "Synonym",
+            Self::Trigger => "Trigger",
         }
     }
 }
@@ -114,6 +122,7 @@ impl Catalog {
             "",
             "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Table".into(),
         );
+        let mut employee_id = None;
         for (schema, name, owner) in [
             ("HumanResources", "Employee", "dbo"),
             ("HumanResources", "Department", "dbo"),
@@ -125,7 +134,7 @@ impl Catalog {
             ("dbo", "AspNetUsers", "dbo"),
             ("dbo", "AuditLog", "dbo"),
         ] {
-            add(
+            let id = add(
                 Some(tables),
                 ObjectKind::Table,
                 name,
@@ -134,6 +143,44 @@ impl Catalog {
                 format!(
                     "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Table[@Name='{name}' and @Schema='{schema}']"
                 ),
+            );
+            if name == "Employee" && schema == "HumanResources" {
+                employee_id = Some(id);
+            }
+        }
+        if let Some(employee_id) = employee_id {
+            let table_urn = "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Table[@Name='Employee' and @Schema='HumanResources']";
+            let cols = add(
+                Some(employee_id),
+                ObjectKind::Folder,
+                "Columns",
+                "",
+                "",
+                format!("{table_urn}/Column"),
+            );
+            let idxs = add(
+                Some(employee_id),
+                ObjectKind::Folder,
+                "Indexes",
+                "",
+                "",
+                format!("{table_urn}/Index"),
+            );
+            add(
+                Some(cols),
+                ObjectKind::Column,
+                "BusinessEntityID",
+                "HumanResources",
+                "",
+                format!("{table_urn}/Column[@Name='BusinessEntityID']"),
+            );
+            add(
+                Some(idxs),
+                ObjectKind::Index,
+                "PK_Employee",
+                "HumanResources",
+                "",
+                format!("{table_urn}/Index[@Name='PK_Employee']"),
             );
         }
 
@@ -186,6 +233,42 @@ impl Catalog {
                 ),
             );
         }
+
+        let synonyms = add(
+            Some(db),
+            ObjectKind::Folder,
+            "Synonyms",
+            "",
+            "",
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Synonym".into(),
+        );
+        add(
+            Some(synonyms),
+            ObjectKind::Synonym,
+            "EmployeeAddress",
+            "Person",
+            "dbo",
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Synonym[@Name='EmployeeAddress' and @Schema='Person']"
+                .into(),
+        );
+
+        let triggers = add(
+            Some(db),
+            ObjectKind::Folder,
+            "Triggers",
+            "",
+            "",
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Trigger".into(),
+        );
+        add(
+            Some(triggers),
+            ObjectKind::Trigger,
+            "dEmployee",
+            "HumanResources",
+            "dbo",
+            "Server[@Name='localhost']/Database[@Name='AdventureWorks']/Trigger[@Name='dEmployee' and @Schema='HumanResources']"
+                .into(),
+        );
 
         Self { objects }
     }
@@ -387,6 +470,46 @@ mod tests {
                 ("Type", "Table"),
             ]
         );
+    }
+
+    #[test]
+    fn object_kind_new_variants_as_str() {
+        assert_eq!(ObjectKind::Column.as_str(), "Column");
+        assert_eq!(ObjectKind::Index.as_str(), "Index");
+        assert_eq!(ObjectKind::Synonym.as_str(), "Synonym");
+        assert_eq!(ObjectKind::Trigger.as_str(), "Trigger");
+    }
+
+    #[test]
+    fn search_includes_synonym_and_trigger() {
+        let cat = Catalog::demo();
+        let sc = SearchConditions::default();
+        let hits = cat.search(&sc);
+        assert!(hits.iter().any(|o| o.kind == ObjectKind::Synonym));
+        assert!(hits.iter().any(|o| o.kind == ObjectKind::Trigger));
+    }
+
+    #[test]
+    fn demo_table_has_column_and_index_children() {
+        let cat = Catalog::demo();
+        let table = cat
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Table && o.name == "Employee")
+            .expect("Employee");
+        let folders: Vec<_> = cat.children(Some(table.id));
+        assert!(folders.iter().any(|o| o.name == "Columns"));
+        assert!(folders.iter().any(|o| o.name == "Indexes"));
+        let cols_folder = folders.iter().find(|o| o.name == "Columns").unwrap();
+        let idx_folder = folders.iter().find(|o| o.name == "Indexes").unwrap();
+        assert!(cat
+            .children(Some(cols_folder.id))
+            .iter()
+            .any(|o| o.kind == ObjectKind::Column));
+        assert!(cat
+            .children(Some(idx_folder.id))
+            .iter()
+            .any(|o| o.kind == ObjectKind::Index));
     }
 
     #[test]

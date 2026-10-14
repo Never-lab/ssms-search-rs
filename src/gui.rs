@@ -1081,6 +1081,10 @@ fn kind_glyph(kind: ObjectKind) -> &'static str {
         ObjectKind::View => "▤",
         ObjectKind::Procedure => "⚙",
         ObjectKind::Function => "ƒ",
+        ObjectKind::Column => "▤",
+        ObjectKind::Index => "⌗",
+        ObjectKind::Synonym => "⇄",
+        ObjectKind::Trigger => "⚡",
     }
 }
 
@@ -1094,6 +1098,10 @@ fn short_type(kind: ObjectKind) -> &'static str {
         ObjectKind::Database => "Database",
         ObjectKind::Server => "Server",
         ObjectKind::Folder => "Folder",
+        ObjectKind::Column => "Column",
+        ObjectKind::Index => "Index",
+        ObjectKind::Synonym => "Synonym",
+        ObjectKind::Trigger => "Trigger",
     }
 }
 
