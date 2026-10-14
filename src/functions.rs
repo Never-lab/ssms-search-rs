@@ -178,14 +178,107 @@ ORDER BY \
         };
         let schema_esc = escape_urn(schema);
         let name_esc = escape_urn(name);
-        add(
+        let object_urn = format!(
+            "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/{type_urn}[@Name='{name_esc}' and @Schema='{schema_esc}']"
+        );
+        let object_id = add(
             Some(parent),
             kind,
             name,
             schema,
             owner,
+            object_urn.clone(),
+        );
+        if kind == ObjectKind::Table {
+            add(
+                Some(object_id),
+                ObjectKind::Folder,
+                "Columns",
+                "",
+                "",
+                table_child_folder_urn(&object_urn, "Columns"),
+            );
+            add(
+                Some(object_id),
+                ObjectKind::Folder,
+                "Indexes",
+                "",
+                "",
+                table_child_folder_urn(&object_urn, "Indexes"),
+            );
+        }
+    }
+
+    let synonyms_id = add(
+        Some(db_id),
+        ObjectKind::Folder,
+        "Synonyms",
+        "",
+        "",
+        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Synonym"),
+    );
+    let syn_stream = client
+        .query(
+            "SELECT s.name AS schema_name, syn.name AS object_name, \
+             ISNULL(USER_NAME(syn.principal_id), s.name) AS owner_name \
+             FROM sys.synonyms AS syn \
+             INNER JOIN sys.schemas AS s ON syn.schema_id = s.schema_id \
+             ORDER BY s.name, syn.name",
+            &[],
+        )
+        .await?;
+    for row in syn_stream.into_first_result().await? {
+        let schema = row.get::<&str, _>(0).unwrap_or("dbo");
+        let name = row.get::<&str, _>(1).unwrap_or("");
+        let owner = row.get::<&str, _>(2).unwrap_or(schema);
+        let schema_esc = escape_urn(schema);
+        let name_esc = escape_urn(name);
+        add(
+            Some(synonyms_id),
+            ObjectKind::Synonym,
+            name,
+            schema,
+            owner,
             format!(
-                "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/{type_urn}[@Name='{name_esc}' and @Schema='{schema_esc}']"
+                "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Synonym[@Name='{name_esc}' and @Schema='{schema_esc}']"
+            ),
+        );
+    }
+
+    let triggers_id = add(
+        Some(db_id),
+        ObjectKind::Folder,
+        "Triggers",
+        "",
+        "",
+        format!("Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Trigger"),
+    );
+    let trig_stream = client
+        .query(
+            "SELECT sch.name AS schema_name, t.name AS object_name, \
+             ISNULL(USER_NAME(o.principal_id), sch.name) AS owner_name \
+             FROM sys.triggers AS t \
+             INNER JOIN sys.objects AS o ON t.object_id = o.object_id \
+             INNER JOIN sys.schemas AS sch ON o.schema_id = sch.schema_id \
+             WHERE t.parent_class = 1 \
+             ORDER BY sch.name, t.name",
+            &[],
+        )
+        .await?;
+    for row in trig_stream.into_first_result().await? {
+        let schema = row.get::<&str, _>(0).unwrap_or("dbo");
+        let name = row.get::<&str, _>(1).unwrap_or("");
+        let owner = row.get::<&str, _>(2).unwrap_or(schema);
+        let schema_esc = escape_urn(schema);
+        let name_esc = escape_urn(name);
+        add(
+            Some(triggers_id),
+            ObjectKind::Trigger,
+            name,
+            schema,
+            owner,
+            format!(
+                "Server[@Name='{server_esc}']/Database[@Name='{db_esc}']/Trigger[@Name='{name_esc}' and @Schema='{schema_esc}']"
             ),
         );
     }
@@ -449,6 +542,10 @@ async fn use_database(client: &mut SqlClient, database: &str) -> Result<()> {
     Ok(())
 }
 
+fn table_child_folder_urn(table_urn: &str, folder: &str) -> String {
+    format!("{table_urn}/{folder}")
+}
+
 fn escape_urn(s: &str) -> String {
     s.replace('\'', "''")
 }
@@ -529,6 +626,19 @@ mod tests {
     fn readonly_is_case_insensitive() {
         assert!(assert_readonly_sql("insert into t values (1)").is_err());
         assert!(assert_readonly_sql("DeLeTe FrOm t").is_err());
+    }
+
+    #[test]
+    fn table_child_folder_urn_appends_segment() {
+        let base = "Server[@Name='s']/Database[@Name='d']/Table[@Name='T' and @Schema='dbo']";
+        assert_eq!(
+            table_child_folder_urn(base, "Columns"),
+            format!("{base}/Columns")
+        );
+        assert_eq!(
+            table_child_folder_urn(base, "Indexes"),
+            format!("{base}/Indexes")
+        );
     }
 
     #[test]
