@@ -287,7 +287,7 @@ pub async fn collect_query_batch(
 
     let outcome: Result<()> = async {
         let mut step = client.execute(sql.into(), ()).await?;
-        loop {
+        'batch: loop {
             match step {
                 StatementResult::End => break,
                 StatementResult::Rows => {
@@ -321,7 +321,12 @@ pub async fn collect_query_batch(
                         }
                         while let Some(row) = client.next_row().await? {
                             if data.rows.len() >= max_rows {
-                                continue;
+                                // Match Quervio: Attention instead of draining the rest.
+                                let _ = client.cancel_query(0).await;
+                                messages.push(format!(
+                                    "Stopped at the limit of {max_rows} rows; the rest of the query was cancelled."
+                                ));
+                                break 'batch;
                             }
                             let cells: Vec<String> = (0..width)
                                 .map(|i| row.get(i).map(cell_to_string).unwrap_or_default())
