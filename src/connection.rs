@@ -251,7 +251,11 @@ async fn collect_results(
                         kept_set = true;
                     }
                 }
-                _ => {}
+                StatementResult::NoRows { rows_affected } => {
+                    if let Some(count) = rows_affected {
+                        messages.push(rows_affected_message(count));
+                    }
+                }
             }
             for info in client.take_info_messages() {
                 messages.push(info.message);
@@ -268,6 +272,9 @@ async fn collect_results(
 }
 
 /// Collect data grid + ShowPlanXML + INFO messages for the Execute path.
+///
+/// Rows are streamed with a `max_rows` cap (no full-set buffer). Showplan sets
+/// are detected from column metadata, same rule as Quervio.
 pub async fn collect_query_batch(
     client: &mut SqlClient,
     sql: impl Into<String>,
@@ -288,46 +295,46 @@ pub async fn collect_query_batch(
                     let meta = client.get_metadata();
                     let width = meta.len().max(1);
                     let cols: Vec<String> = meta.iter().map(|c| c.column_name.clone()).collect();
-                    let mut set_rows = Vec::new();
-                    while let Some(row) = client.next_row().await? {
-                        let cells: Vec<String> = (0..width)
-                            .map(|i| row.get(i).map(cell_to_string).unwrap_or_default())
-                            .collect();
-                        set_rows.push(cells);
-                    }
+                    let is_plan = is_plan_result(cols.iter().map(String::as_str));
 
-                    let mut captured_plan = false;
-                    for row in &set_rows {
-                        for cell in row {
-                            if cell.trim_start().starts_with("<ShowPlanXML")
-                                || cell.contains("<ShowPlanXML")
-                            {
-                                plan_xml = Some(cell.clone());
-                                messages.push(format!(
-                                    "Captured ShowPlanXML (result set #{result_sets})"
-                                ));
-                                captured_plan = true;
-                                break;
+                    if is_plan {
+                        while let Some(row) = client.next_row().await? {
+                            if plan_xml.is_some() {
+                                continue;
+                            }
+                            for i in 0..width {
+                                let cell = row.get(i).map(cell_to_string).unwrap_or_default();
+                                if cell.trim_start().starts_with("<ShowPlanXML")
+                                    || cell.contains("<ShowPlanXML")
+                                {
+                                    plan_xml = Some(cell);
+                                    messages.push(format!(
+                                        "Captured ShowPlanXML (result set #{result_sets})"
+                                    ));
+                                    break;
+                                }
                             }
                         }
-                        if captured_plan {
-                            break;
-                        }
-                    }
-
-                    if !captured_plan {
+                    } else {
                         if data.columns.is_empty() {
                             data.columns = cols;
                         }
-                        for row in set_rows {
+                        while let Some(row) = client.next_row().await? {
                             if data.rows.len() >= max_rows {
-                                break;
+                                continue;
                             }
-                            data.rows.push(row);
+                            let cells: Vec<String> = (0..width)
+                                .map(|i| row.get(i).map(cell_to_string).unwrap_or_default())
+                                .collect();
+                            data.rows.push(cells);
                         }
                     }
                 }
-                _ => {}
+                StatementResult::NoRows { rows_affected } => {
+                    if let Some(count) = rows_affected {
+                        messages.push(rows_affected_message(count));
+                    }
+                }
             }
             for info in client.take_info_messages() {
                 messages.push(info.message);
@@ -341,6 +348,23 @@ pub async fn collect_query_batch(
     outcome?;
     closed?;
     Ok((data, plan_xml, messages))
+}
+
+/// Showplan result set: single XML column from `SET SHOWPLAN_XML` / `STATISTICS XML`.
+fn is_plan_result<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    matches!(
+        (names.next(), names.next()),
+        (Some(name), None)
+            if name.starts_with("Microsoft SQL Server") && name.ends_with("XML Showplan")
+    )
+}
+
+fn rows_affected_message(count: u64) -> String {
+    if count == 1 {
+        "(1 row affected)".into()
+    } else {
+        format!("({count} rows affected)")
+    }
 }
 
 fn cell_to_string(value: &mssql_tds::datatypes::column_values::ColumnValues) -> String {
@@ -406,6 +430,22 @@ mod tests {
             parse_server_host_port(r"localhost\SQLEXPRESS", 1433),
             (r"localhost\SQLEXPRESS".into(), 1433)
         );
+        assert_eq!(
+            parse_server_host_port(r"HOST\SQLEXPRESS,1435", 1433),
+            (r"HOST\SQLEXPRESS".into(), 1435)
+        );
+    }
+
+    #[test]
+    fn parse_invalid_port_suffix_falls_back() {
+        assert_eq!(
+            parse_server_host_port("host,notaport", 1433),
+            ("host,notaport".into(), 1433)
+        );
+        assert_eq!(
+            parse_server_host_port("host:notaport", 1433),
+            ("host:notaport".into(), 1433)
+        );
     }
 
     #[test]
@@ -437,5 +477,47 @@ mod tests {
         assert!(args("localhost", 1433, Some("sa"), Some("x"))
             .to_context()
             .is_ok());
+    }
+
+    #[test]
+    fn to_context_accepts_trusted_without_user() {
+        let mut a = args("localhost", 1433, None, None);
+        a.trusted = true;
+        #[cfg(windows)]
+        assert!(a.to_context().is_ok());
+        #[cfg(not(windows))]
+        assert!(a.to_context().is_err());
+    }
+
+    #[test]
+    fn is_connection_error_detects_reset() {
+        let e = anyhow::anyhow!("TCP connection reset by peer");
+        assert!(is_connection_error(&e));
+    }
+
+    #[test]
+    fn is_connection_error_ignores_sql_syntax() {
+        let e = anyhow::anyhow!("Incorrect syntax near 'SELEC'");
+        assert!(!is_connection_error(&e));
+    }
+
+    #[test]
+    fn only_the_showplan_xml_column_is_a_plan() {
+        assert!(is_plan_result(
+            ["Microsoft SQL Server 2005 XML Showplan"].into_iter()
+        ));
+        assert!(!is_plan_result(["ShowplanFlag", "Id"].into_iter()));
+        assert!(!is_plan_result(["Showplan"].into_iter()));
+        assert!(!is_plan_result(
+            ["Microsoft SQL Server 2005 XML Showplan", "Other"].into_iter()
+        ));
+        assert!(!is_plan_result(std::iter::empty()));
+    }
+
+    #[test]
+    fn rows_affected_message_pluralizes() {
+        assert_eq!(rows_affected_message(0), "(0 rows affected)");
+        assert_eq!(rows_affected_message(1), "(1 row affected)");
+        assert_eq!(rows_affected_message(2), "(2 rows affected)");
     }
 }

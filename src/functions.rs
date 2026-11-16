@@ -453,8 +453,7 @@ pub async fn describe_object(
                     name: cell(&row, 0).to_string(),
                     data_type: cell(&row, 1).to_string(),
                     max_length: cell(&row, 2).parse().unwrap_or(0),
-                    is_nullable: cell(&row, 3) == "1"
-                        || cell(&row, 3).eq_ignore_ascii_case("true"),
+                    is_nullable: cell(&row, 3) == "1" || cell(&row, 3).eq_ignore_ascii_case("true"),
                 })
                 .collect())
         },
