@@ -1,12 +1,12 @@
 //! Multi-function SQL operations (SSMS-inspired).
 
 use crate::catalog::{Catalog, CatalogObject, ObjectKind};
-use crate::connection::SqlClient;
+use crate::connection::{
+    collect_query_batch, execute_ignore, query_table, sql_nvarchar, SqlClient,
+};
 use crate::plan::{parse_showplan_operators, PlanOperator};
-use anyhow::{bail, Context, Result};
-use futures::stream::TryStreamExt;
+use anyhow::{bail, Result};
 use std::time::Instant;
-use tiberius::QueryItem;
 
 #[derive(Debug, Clone)]
 pub struct DbInfo {
@@ -50,22 +50,21 @@ pub struct QueryExecution {
 
 pub async fn list_databases(client: &mut SqlClient) -> Result<Vec<DbInfo>> {
     crate::trace::timed_result("engine.list_databases", "", async {
-        let stream = client
-            .query(
-                "SELECT name, database_id, state_desc \
+        let table = query_table(
+            client,
+            "SELECT name, database_id, state_desc \
              FROM sys.databases \
              WHERE state = 0 \
              ORDER BY name",
-                &[],
-            )
-            .await?;
-        let rows = stream.into_first_result().await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
+            None,
+        )
+        .await?;
+        let mut out = Vec::with_capacity(table.rows.len());
+        for row in table.rows {
             out.push(DbInfo {
-                name: row.get::<&str, _>(0).unwrap_or("").to_string(),
-                database_id: row.get::<i32, _>(1).unwrap_or(0),
-                state_desc: row.get::<&str, _>(2).unwrap_or("").to_string(),
+                name: cell(&row, 0).to_string(),
+                database_id: cell(&row, 1).parse().unwrap_or(0),
+                state_desc: cell(&row, 2).to_string(),
             });
         }
         Ok(out)
@@ -288,8 +287,7 @@ ORDER BY \
   CASE o.type WHEN N'U' THEN 1 WHEN N'V' THEN 2 WHEN N'P' THEN 3 ELSE 4 END, \
   s.name, o.name";
 
-    let stream = client.query(q, &[]).await?;
-    let rows = stream.into_first_result().await?;
+    let rows = query_table(client, q, None).await?.rows;
 
     let db_urn = database_urn(server, database);
     let folder = |b: &mut Builder<'_>, name: &str, urn_kind: &str| {
@@ -309,11 +307,11 @@ ORDER BY \
     let funcs_id = folder(b, "Functions", "UserDefinedFunction");
 
     for row in rows {
-        let schema = row.get::<&str, _>(0).unwrap_or("dbo");
-        let name = row.get::<&str, _>(1).unwrap_or("");
-        let type_code = row.get::<&str, _>(2).unwrap_or("U").trim();
-        let owner = row.get::<&str, _>(3).unwrap_or(schema);
-        let date = row.get::<&str, _>(4).unwrap_or("");
+        let schema = nonempty(cell(&row, 0), "dbo");
+        let name = cell(&row, 1);
+        let type_code = cell(&row, 2).trim();
+        let owner = nonempty(cell(&row, 3), schema);
+        let date = cell(&row, 4);
         let (kind, parent, type_urn) = match type_code {
             "U" => (ObjectKind::Table, tables_id, "Table"),
             "V" => (ObjectKind::View, views_id, "View"),
@@ -351,22 +349,23 @@ ORDER BY \
     }
 
     let synonyms_id = folder(b, "Synonyms", "Synonym");
-    let syn_stream = client
-        .query(
-            "SELECT s.name AS schema_name, syn.name AS object_name, \
+    let syn_rows = query_table(
+        client,
+        "SELECT s.name AS schema_name, syn.name AS object_name, \
              ISNULL(USER_NAME(syn.principal_id), s.name) AS owner_name, \
              CONVERT(varchar(33), syn.create_date, 126) AS create_date \
              FROM sys.synonyms AS syn \
              INNER JOIN sys.schemas AS s ON syn.schema_id = s.schema_id \
              ORDER BY s.name, syn.name",
-            &[],
-        )
-        .await?;
-    for row in syn_stream.into_first_result().await? {
-        let schema = row.get::<&str, _>(0).unwrap_or("dbo");
-        let name = row.get::<&str, _>(1).unwrap_or("");
-        let owner = row.get::<&str, _>(2).unwrap_or(schema);
-        let date = row.get::<&str, _>(3).unwrap_or("");
+        None,
+    )
+    .await?
+    .rows;
+    for row in syn_rows {
+        let schema = nonempty(cell(&row, 0), "dbo");
+        let name = cell(&row, 1);
+        let owner = nonempty(cell(&row, 2), schema);
+        let date = cell(&row, 3);
         b.add(
             Some(synonyms_id),
             ObjectKind::Synonym,
@@ -383,9 +382,9 @@ ORDER BY \
     }
 
     let triggers_id = folder(b, "Triggers", "Trigger");
-    let trig_stream = client
-        .query(
-            "SELECT sch.name AS schema_name, t.name AS object_name, \
+    let trig_rows = query_table(
+        client,
+        "SELECT sch.name AS schema_name, t.name AS object_name, \
              ISNULL(USER_NAME(o.principal_id), sch.name) AS owner_name, \
              CONVERT(varchar(33), t.create_date, 126) AS create_date \
              FROM sys.triggers AS t \
@@ -393,14 +392,15 @@ ORDER BY \
              INNER JOIN sys.schemas AS sch ON o.schema_id = sch.schema_id \
              WHERE t.parent_class = 1 \
              ORDER BY sch.name, t.name",
-            &[],
-        )
-        .await?;
-    for row in trig_stream.into_first_result().await? {
-        let schema = row.get::<&str, _>(0).unwrap_or("dbo");
-        let name = row.get::<&str, _>(1).unwrap_or("");
-        let owner = row.get::<&str, _>(2).unwrap_or(schema);
-        let date = row.get::<&str, _>(3).unwrap_or("");
+        None,
+    )
+    .await?
+    .rows;
+    for row in trig_rows {
+        let schema = nonempty(cell(&row, 0), "dbo");
+        let name = cell(&row, 1);
+        let owner = nonempty(cell(&row, 2), schema);
+        let date = cell(&row, 3);
         b.add(
             Some(triggers_id),
             ObjectKind::Trigger,
@@ -429,9 +429,8 @@ pub async fn describe_object(
         format!("{database}.{schema}.{name}"),
         async {
             use_database(client, database).await?;
-            let stream = client
-                .query(
-                    "SELECT c.name, \
+            let sql = format!(
+                "SELECT c.name, \
                     t.name AS type_name, \
                     c.max_length, \
                     c.is_nullable \
@@ -439,22 +438,22 @@ pub async fn describe_object(
              INNER JOIN sys.types AS t ON c.user_type_id = t.user_type_id \
              INNER JOIN sys.objects AS o ON c.object_id = o.object_id \
              INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id \
-             WHERE s.name = @P1 AND o.name = @P2 \
+             WHERE s.name = {schema} AND o.name = {name} \
              ORDER BY c.column_id",
-                    &[&schema, &name],
-                )
-                .await?;
-            let rows = stream.into_first_result().await?;
+                schema = sql_nvarchar(schema),
+                name = sql_nvarchar(name),
+            );
+            let rows = query_table(client, sql, None).await?.rows;
             if rows.is_empty() {
                 bail!("object not found or has no columns: {schema}.{name}");
             }
             Ok(rows
                 .into_iter()
                 .map(|row| ColumnInfo {
-                    name: row.get::<&str, _>(0).unwrap_or("").to_string(),
-                    data_type: row.get::<&str, _>(1).unwrap_or("").to_string(),
-                    max_length: row.get::<i16, _>(2).unwrap_or(0),
-                    is_nullable: row.get::<bool, _>(3).unwrap_or(false),
+                    name: cell(&row, 0).to_string(),
+                    data_type: cell(&row, 1).to_string(),
+                    max_length: cell(&row, 2).parse().unwrap_or(0),
+                    is_nullable: cell(&row, 3) == "1" || cell(&row, 3).eq_ignore_ascii_case("true"),
                 })
                 .collect())
         },
@@ -502,49 +501,33 @@ pub async fn load_table_children(
                 next += 1;
             };
 
-            let cols = client
-                .query(
-                    "SELECT c.name \
+            let cols_sql = format!(
+                "SELECT c.name \
              FROM sys.columns AS c \
              INNER JOIN sys.types AS t ON c.user_type_id = t.user_type_id \
              INNER JOIN sys.objects AS o ON c.object_id = o.object_id \
              INNER JOIN sys.schemas AS s ON o.schema_id = s.schema_id \
-             WHERE s.name = @P1 AND o.name = @P2 \
+             WHERE s.name = {schema} AND o.name = {table} \
              ORDER BY c.column_id",
-                    &[&schema, &table_name],
-                )
-                .await?
-                .into_first_result()
-                .await?;
-            for row in cols {
-                push(
-                    columns_folder_id,
-                    ObjectKind::Column,
-                    row.get::<&str, _>(0).unwrap_or(""),
-                    "Column",
-                );
+                schema = sql_nvarchar(schema),
+                table = sql_nvarchar(table_name),
+            );
+            for row in query_table(client, cols_sql, None).await?.rows {
+                push(columns_folder_id, ObjectKind::Column, cell(&row, 0), "Column");
             }
 
-            let idx = client
-                .query(
-                    "SELECT i.name \
+            let idx_sql = format!(
+                "SELECT i.name \
              FROM sys.indexes AS i \
              INNER JOIN sys.tables AS t ON i.object_id = t.object_id \
              INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id \
-             WHERE s.name = @P1 AND t.name = @P2 AND i.index_id > 0 AND i.name IS NOT NULL \
+             WHERE s.name = {schema} AND t.name = {table} AND i.index_id > 0 AND i.name IS NOT NULL \
              ORDER BY i.name",
-                    &[&schema, &table_name],
-                )
-                .await?
-                .into_first_result()
-                .await?;
-            for row in idx {
-                push(
-                    indexes_folder_id,
-                    ObjectKind::Index,
-                    row.get::<&str, _>(0).unwrap_or(""),
-                    "Index",
-                );
+                schema = sql_nvarchar(schema),
+                table = sql_nvarchar(table_name),
+            );
+            for row in query_table(client, idx_sql, None).await?.rows {
+                push(indexes_folder_id, ObjectKind::Index, cell(&row, 0), "Index");
             }
             Ok(out)
         },
@@ -632,21 +615,13 @@ pub async fn run_query_ex(
                 match plan_mode {
                     PlanMode::None => {}
                     PlanMode::Estimated => {
-                        client
-                            .simple_query("SET SHOWPLAN_XML ON;")
-                            .await?
-                            .into_results()
-                            .await?;
+                        execute_ignore(client, "SET SHOWPLAN_XML ON;").await?;
                         messages.push(
                             "SET SHOWPLAN_XML ON — estimated plan (query not executed)".into(),
                         );
                     }
                     PlanMode::Actual => {
-                        client
-                            .simple_query("SET STATISTICS XML ON;")
-                            .await?
-                            .into_results()
-                            .await?;
+                        execute_ignore(client, "SET STATISTICS XML ON;").await?;
                         messages.push("SET STATISTICS XML ON — actual execution plan".into());
                     }
                 }
@@ -654,7 +629,7 @@ pub async fn run_query_ex(
 
             let batch_result = {
                 let _span = crate::trace::Span::new("engine.run_query_ex.collect");
-                collect_query_streams(client, trimmed, max_rows).await
+                collect_query_batch(client, trimmed, max_rows).await
             };
 
             {
@@ -662,19 +637,19 @@ pub async fn run_query_ex(
                 match plan_mode {
                     PlanMode::None => {}
                     PlanMode::Estimated => {
-                        if let Ok(s) = client.simple_query("SET SHOWPLAN_XML OFF;").await {
-                            let _ = s.into_results().await;
-                        }
+                        let _ = execute_ignore(client, "SET SHOWPLAN_XML OFF;").await;
                     }
                     PlanMode::Actual => {
-                        if let Ok(s) = client.simple_query("SET STATISTICS XML OFF;").await {
-                            let _ = s.into_results().await;
-                        }
+                        let _ = execute_ignore(client, "SET STATISTICS XML OFF;").await;
                     }
                 }
             }
 
-            let (mut result, mut plan_xml, mut extra_msgs) = batch_result?;
+            let (table, mut plan_xml, mut extra_msgs) = batch_result?;
+            let mut result = QueryResult {
+                columns: table.columns,
+                rows: table.rows,
+            };
             messages.append(&mut extra_msgs);
 
             if plan_xml.is_none() {
@@ -716,60 +691,6 @@ pub async fn run_query_ex(
     .await
 }
 
-async fn collect_query_streams(
-    client: &mut SqlClient,
-    sql: &str,
-    max_rows: usize,
-) -> Result<(QueryResult, Option<String>, Vec<String>)> {
-    let mut stream = client.simple_query(sql).await?;
-    let mut data_columns = Vec::new();
-    let mut data_rows = Vec::new();
-    let mut current_width = 0usize;
-    let mut plan_xml = None;
-    let mut messages = Vec::new();
-    let mut result_sets = 0u32;
-
-    while let Some(item) = stream.try_next().await? {
-        match item {
-            QueryItem::Metadata(meta) => {
-                result_sets += 1;
-                current_width = meta.columns().len().max(1);
-                if data_columns.is_empty() {
-                    data_columns = meta
-                        .columns()
-                        .iter()
-                        .map(|c| c.name().to_string())
-                        .collect();
-                }
-            }
-            QueryItem::Row(row) => {
-                let mut vals = Vec::with_capacity(current_width.max(1));
-                for i in 0..current_width.max(1) {
-                    vals.push(cell_to_string(&row, i));
-                }
-                let joined = vals.first().cloned().unwrap_or_default();
-                if joined.trim_start().starts_with("<ShowPlanXML")
-                    || joined.contains("<ShowPlanXML")
-                {
-                    plan_xml = Some(joined);
-                    messages.push(format!("Captured ShowPlanXML (result set #{result_sets})"));
-                } else if data_rows.len() < max_rows {
-                    data_rows.push(vals);
-                }
-            }
-        }
-    }
-
-    Ok((
-        QueryResult {
-            columns: data_columns,
-            rows: data_rows,
-        },
-        plan_xml,
-        messages,
-    ))
-}
-
 fn extract_plan_from_result(result: &QueryResult) -> Option<String> {
     for row in &result.rows {
         for cell in row {
@@ -792,19 +713,22 @@ pub async fn object_definition(
         format!("{database}.{schema}.{name}"),
         async {
             use_database(client, database).await?;
-            let stream = client
-                .query(
-                    "SELECT OBJECT_DEFINITION(OBJECT_ID(QUOTENAME(@P1) + N'.' + QUOTENAME(@P2)))",
-                    &[&schema, &name],
-                )
-                .await?;
-            let row = stream.into_row().await?.context("no definition returned")?;
-            match row.get::<&str, _>(0) {
-                Some(s) if !s.is_empty() => Ok(s.to_string()),
-                _ => {
-                    bail!("no MODULE definition for {schema}.{name} (tables have no OBJECT_DEFINITION)")
-                }
+            let sql = format!(
+                "SELECT OBJECT_DEFINITION(OBJECT_ID(QUOTENAME({schema}) + N'.' + QUOTENAME({name})))",
+                schema = sql_nvarchar(schema),
+                name = sql_nvarchar(name),
+            );
+            let table = query_table(client, sql, Some(1)).await?;
+            let def = table
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .map(String::as_str)
+                .unwrap_or("");
+            if def.is_empty() {
+                bail!("no MODULE definition for {schema}.{name} (tables have no OBJECT_DEFINITION)")
             }
+            Ok(def.to_string())
         },
     )
     .await
@@ -817,7 +741,7 @@ async fn use_database(client: &mut SqlClient, database: &str) -> Result<()> {
             bail!("invalid database name: {database:?}");
         }
         let sql = format!("USE [{}]", database.replace(']', "]]"));
-        client.simple_query(sql).await?.into_results().await?;
+        execute_ignore(client, sql).await?;
         Ok(())
     })
     .await
@@ -835,42 +759,16 @@ fn escape_urn(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-fn cell_to_string(row: &tiberius::Row, index: usize) -> String {
-    // `Row::get` panics on type mismatch; try_get returns Err instead.
-    if let Ok(Some(v)) = row.try_get::<&str, _>(index) {
-        return v.to_string();
+fn cell(row: &[String], index: usize) -> &str {
+    row.get(index).map(String::as_str).unwrap_or("")
+}
+
+fn nonempty<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
     }
-    if let Ok(Some(v)) = row.try_get::<i32, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<i64, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<i16, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<u8, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<bool, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<f64, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<f32, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<chrono::NaiveDateTime, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(index) {
-        return v.to_string();
-    }
-    if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(index) {
-        return v.to_string();
-    }
-    String::new()
 }
 
 #[cfg(test)]

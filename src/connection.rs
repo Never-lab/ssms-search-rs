@@ -1,16 +1,19 @@
-//! SQL Server connection (TDS via tiberius).
+//! SQL Server connection (TDS via `mssql-tds`, same driver choice as Quervio).
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
+use mssql_tds::connection::tds_client::{ResultSet, StatementResult, TdsClient};
+use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+use mssql_tds::core::EncryptionSetting;
 use std::time::Duration;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
-use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+use crate::format;
 
 /// Cap hung TCP/TDS logins so the GUI can show an error and retry.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub type SqlClient = Client<Compat<TcpStream>>;
+pub type SqlClient = TdsClient;
 
 #[derive(Debug, Clone, Args)]
 pub struct ConnectArgs {
@@ -48,37 +51,44 @@ pub struct ConnectArgs {
 }
 
 impl ConnectArgs {
-    pub fn to_config(&self) -> Result<Config> {
-        let mut config = Config::new();
-
+    /// Address string accepted by `mssql-tds` (`host`, `host,port`, `host\instance`).
+    pub fn server_address(&self) -> String {
         let (host, port) = parse_server_host_port(&self.server, self.port);
-        config.host(host);
-        config.port(port);
-        config.database(&self.database);
-        config.application_name(&self.app_name);
-
-        if self.trust_cert {
-            config.trust_cert();
+        if self.server.contains(',') {
+            return self.server.trim().to_string();
         }
-        // Prefer encryption when available; TrustCert covers lab boxes.
-        config.encryption(EncryptionLevel::Required);
+        if host.contains('\\') {
+            return host;
+        }
+        format!("{host},{port}")
+    }
+
+    pub fn to_context(&self) -> Result<ClientContext> {
+        let mut context = ClientContext::default();
+        context.application_name = self.app_name.clone();
+        context.login_timeout = Some(CONNECT_TIMEOUT.as_secs() as u32);
+        context.database = self.database.clone();
+        context.encryption_options.mode = EncryptionSetting::Required;
+        context.encryption_options.trust_server_certificate = self.trust_cert;
 
         if self.trusted {
             #[cfg(windows)]
             {
-                config.authentication(AuthMethod::Integrated);
+                context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
             }
             #[cfg(not(windows))]
             {
                 bail!(
                     "Windows Integrated Auth (--trusted) is only available on Windows \
-                     (enable tiberius winauth / SSPI)"
+                     (mssql-tds SSPI)"
                 );
             }
         } else {
             match (&self.user, &self.password) {
                 (Some(u), Some(p)) => {
-                    config.authentication(AuthMethod::sql_server(u, p));
+                    context.tds_authentication_method = TdsAuthenticationMethod::Password;
+                    context.user_name = u.clone();
+                    context.password = p.clone();
                 }
                 (None, None) => {
                     bail!(
@@ -90,19 +100,17 @@ impl ConnectArgs {
             }
         }
 
-        Ok(config)
+        Ok(context)
     }
 }
 
 /// Parse `host`, `host,port`, `host:port`, or `host\instance` (instance keeps default port).
 pub fn parse_server_host_port(server: &str, default_port: u16) -> (String, u16) {
-    // host,port
     if let Some((h, p)) = server.rsplit_once(',') {
         if let Ok(port) = p.trim().parse::<u16>() {
             return (h.trim().to_string(), port);
         }
     }
-    // host:port (non-instance)
     if !server.contains('\\') {
         if let Some((h, p)) = server.rsplit_once(':') {
             if let Ok(port) = p.trim().parse::<u16>() {
@@ -114,26 +122,18 @@ pub fn parse_server_host_port(server: &str, default_port: u16) -> (String, u16) 
 }
 
 pub async fn connect(args: &ConnectArgs) -> Result<SqlClient> {
-    let (host, port) = parse_server_host_port(&args.server, args.port);
+    let address = args.server_address();
     crate::trace::timed_result(
         "engine.connect",
-        format!("{host}:{port} db={}", args.database),
+        format!("{address} db={}", args.database),
         async {
-            let config = args.to_config()?;
-            let host = host.clone();
-            let fut = async {
-                let tcp = TcpStream::connect(format!("{host}:{port}"))
-                    .await
-                    .with_context(|| format!("TCP connect failed to {host}:{port}"))?;
-                tcp.set_nodelay(true)?;
-                Client::connect(config, tcp.compat_write())
-                    .await
-                    .context("TDS login failed")
-            };
+            let context = args.to_context()?;
+            let fut = TdsConnectionProvider {}.create_client(context, &address, None);
             match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
-                Ok(r) => r,
+                Ok(Ok(client)) => Ok(client),
+                Ok(Err(e)) => Err(e).context("TDS login failed"),
                 Err(_) => bail!(
-                    "connection timed out after {}s to {host}:{port}",
+                    "connection timed out after {}s to {address}",
                     CONNECT_TIMEOUT.as_secs()
                 ),
             }
@@ -144,17 +144,18 @@ pub async fn connect(args: &ConnectArgs) -> Result<SqlClient> {
 
 pub async fn ping(client: &mut SqlClient) -> Result<(String, String, String)> {
     crate::trace::timed_result("engine.ping", "", async {
-        let stream = client
-            .query(
-                "SELECT @@SERVERNAME AS server_name, DB_NAME() AS db_name, SUSER_SNAME() AS login_name",
-                &[],
-            )
-            .await?;
-        let row = stream.into_row().await?.context("empty ping result")?;
-        let server: String = row.get::<&str, _>(0).unwrap_or("?").to_string();
-        let db: String = row.get::<&str, _>(1).unwrap_or("?").to_string();
-        let login: String = row.get::<&str, _>(2).unwrap_or("?").to_string();
-        Ok((server, db, login))
+        let table = query_table(
+            client,
+            "SELECT @@SERVERNAME AS server_name, DB_NAME() AS db_name, SUSER_SNAME() AS login_name",
+            None,
+        )
+        .await?;
+        let row = table.rows.first().context("empty ping result")?;
+        Ok((
+            row.first().cloned().unwrap_or_else(|| "?".into()),
+            row.get(1).cloned().unwrap_or_else(|| "?".into()),
+            row.get(2).cloned().unwrap_or_else(|| "?".into()),
+        ))
     })
     .await
 }
@@ -180,6 +181,203 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryTable {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Escape a Unicode string literal for embedding in T-SQL (`N'…'`).
+pub fn sql_nvarchar(value: &str) -> String {
+    format!("N'{}'", value.replace('\'', "''"))
+}
+
+/// Run a batch and collect the first result set as text cells (empty = SQL NULL).
+pub async fn query_table(
+    client: &mut SqlClient,
+    sql: impl Into<String>,
+    max_rows: Option<usize>,
+) -> Result<QueryTable> {
+    let (table, _messages) = collect_results(client, sql, max_rows, true).await?;
+    Ok(table)
+}
+
+/// Execute a batch, draining all result sets (e.g. `USE`, `SET …`).
+pub async fn execute_ignore(client: &mut SqlClient, sql: impl Into<String>) -> Result<()> {
+    let (_table, _messages) = collect_results(client, sql, Some(0), false).await?;
+    Ok(())
+}
+
+async fn collect_results(
+    client: &mut SqlClient,
+    sql: impl Into<String>,
+    max_rows: Option<usize>,
+    first_set_only: bool,
+) -> Result<(QueryTable, Vec<String>)> {
+    let mut table = QueryTable::default();
+    let mut messages = Vec::new();
+    let mut kept_set = false;
+
+    let outcome: Result<()> = async {
+        let mut step = client.execute(sql.into(), ()).await?;
+        loop {
+            match step {
+                StatementResult::End => break,
+                StatementResult::Rows => {
+                    let meta = client.get_metadata();
+                    let width = meta.len().max(1);
+                    let cols: Vec<String> = meta.iter().map(|c| c.column_name.clone()).collect();
+                    let take_rows = !first_set_only || !kept_set;
+                    if take_rows && table.columns.is_empty() {
+                        table.columns = cols;
+                    }
+                    while let Some(row) = client.next_row().await? {
+                        if !take_rows {
+                            continue;
+                        }
+                        if let Some(limit) = max_rows {
+                            if table.rows.len() >= limit {
+                                continue;
+                            }
+                        }
+                        let cells: Vec<String> = (0..width)
+                            .map(|i| row.get(i).map(cell_to_string).unwrap_or_default())
+                            .collect();
+                        table.rows.push(cells);
+                    }
+                    if take_rows {
+                        kept_set = true;
+                    }
+                }
+                StatementResult::NoRows { rows_affected } => {
+                    if let Some(count) = rows_affected {
+                        messages.push(rows_affected_message(count));
+                    }
+                }
+            }
+            for info in client.take_info_messages() {
+                messages.push(info.message);
+            }
+            step = client.advance().await?;
+        }
+        Ok(())
+    }
+    .await;
+    let closed = client.close_query().await;
+    outcome?;
+    closed?;
+    Ok((table, messages))
+}
+
+/// Collect data grid + ShowPlanXML + INFO messages for the Execute path.
+///
+/// Rows are streamed with a `max_rows` cap (no full-set buffer). Showplan sets
+/// are detected from column metadata, same rule as Quervio.
+pub async fn collect_query_batch(
+    client: &mut SqlClient,
+    sql: impl Into<String>,
+    max_rows: usize,
+) -> Result<(QueryTable, Option<String>, Vec<String>)> {
+    let mut data = QueryTable::default();
+    let mut plan_xml = None;
+    let mut messages = Vec::new();
+    let mut result_sets = 0u32;
+
+    let outcome: Result<()> = async {
+        let mut step = client.execute(sql.into(), ()).await?;
+        'batch: loop {
+            match step {
+                StatementResult::End => break,
+                StatementResult::Rows => {
+                    result_sets += 1;
+                    let meta = client.get_metadata();
+                    let width = meta.len().max(1);
+                    let cols: Vec<String> = meta.iter().map(|c| c.column_name.clone()).collect();
+                    let is_plan = is_plan_result(cols.iter().map(String::as_str));
+
+                    if is_plan {
+                        while let Some(row) = client.next_row().await? {
+                            if plan_xml.is_some() {
+                                continue;
+                            }
+                            for i in 0..width {
+                                let cell = row.get(i).map(cell_to_string).unwrap_or_default();
+                                if cell.trim_start().starts_with("<ShowPlanXML")
+                                    || cell.contains("<ShowPlanXML")
+                                {
+                                    plan_xml = Some(cell);
+                                    messages.push(format!(
+                                        "Captured ShowPlanXML (result set #{result_sets})"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        if data.columns.is_empty() {
+                            data.columns = cols;
+                        }
+                        while let Some(row) = client.next_row().await? {
+                            if data.rows.len() >= max_rows {
+                                // Match Quervio: Attention instead of draining the rest.
+                                let _ = client.cancel_query(0).await;
+                                messages.push(format!(
+                                    "Stopped at the limit of {max_rows} rows; the rest of the query was cancelled."
+                                ));
+                                break 'batch;
+                            }
+                            let cells: Vec<String> = (0..width)
+                                .map(|i| row.get(i).map(cell_to_string).unwrap_or_default())
+                                .collect();
+                            data.rows.push(cells);
+                        }
+                    }
+                }
+                StatementResult::NoRows { rows_affected } => {
+                    if let Some(count) = rows_affected {
+                        messages.push(rows_affected_message(count));
+                    }
+                }
+            }
+            for info in client.take_info_messages() {
+                messages.push(info.message);
+            }
+            step = client.advance().await?;
+        }
+        Ok(())
+    }
+    .await;
+    let closed = client.close_query().await;
+    outcome?;
+    closed?;
+    Ok((data, plan_xml, messages))
+}
+
+/// Showplan result set: single XML column from `SET SHOWPLAN_XML` / `STATISTICS XML`.
+fn is_plan_result<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    matches!(
+        (names.next(), names.next()),
+        (Some(name), None)
+            if name.starts_with("Microsoft SQL Server") && name.ends_with("XML Showplan")
+    )
+}
+
+fn rows_affected_message(count: u64) -> String {
+    if count == 1 {
+        "(1 row affected)".into()
+    } else {
+        format!("({count} rows affected)")
+    }
+}
+
+fn cell_to_string(value: &mssql_tds::datatypes::column_values::ColumnValues) -> String {
+    let mut out = String::new();
+    match format::write_value(value, &mut out) {
+        Some(()) => out,
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -233,10 +431,9 @@ mod tests {
 
     #[test]
     fn parse_named_instance_keeps_default_port() {
-        // backslash instance must not be split on ':' inside future forms; comma still wins
         assert_eq!(
-            parse_server_host_port(r"HOST\SQLEXPRESS", 1433),
-            (r"HOST\SQLEXPRESS".into(), 1433)
+            parse_server_host_port(r"localhost\SQLEXPRESS", 1433),
+            (r"localhost\SQLEXPRESS".into(), 1433)
         );
         assert_eq!(
             parse_server_host_port(r"HOST\SQLEXPRESS,1435", 1433),
@@ -257,29 +454,44 @@ mod tests {
     }
 
     #[test]
-    fn to_config_requires_both_user_and_password() {
-        let only_user = args("localhost", 1433, Some("sa"), None);
-        assert!(only_user.to_config().is_err());
-        let only_pw = args("localhost", 1433, None, Some("x"));
-        assert!(only_pw.to_config().is_err());
-        let none = args("localhost", 1433, None, None);
-        assert!(none.to_config().is_err());
+    fn server_address_appends_port() {
+        let a = args("localhost", 1433, Some("sa"), Some("x"));
+        assert_eq!(a.server_address(), "localhost,1433");
     }
 
     #[test]
-    fn to_config_accepts_sql_auth() {
-        let ok = args("sql.lab,14333", 1433, Some("sa"), Some("secret"));
-        assert!(ok.to_config().is_ok());
+    fn server_address_keeps_comma_port() {
+        let a = args("db.local,1500", 1433, Some("sa"), Some("x"));
+        assert_eq!(a.server_address(), "db.local,1500");
     }
 
     #[test]
-    fn to_config_accepts_trusted_without_user() {
+    fn sql_nvarchar_escapes_quotes() {
+        assert_eq!(sql_nvarchar("O'Brien"), "N'O''Brien'");
+    }
+
+    #[test]
+    fn sql_auth_requires_both_user_and_password() {
+        assert!(args("localhost", 1433, Some("sa"), None)
+            .to_context()
+            .is_err());
+        assert!(args("localhost", 1433, None, Some("x"))
+            .to_context()
+            .is_err());
+        assert!(args("localhost", 1433, None, None).to_context().is_err());
+        assert!(args("localhost", 1433, Some("sa"), Some("x"))
+            .to_context()
+            .is_ok());
+    }
+
+    #[test]
+    fn to_context_accepts_trusted_without_user() {
         let mut a = args("localhost", 1433, None, None);
         a.trusted = true;
         #[cfg(windows)]
-        assert!(a.to_config().is_ok());
+        assert!(a.to_context().is_ok());
         #[cfg(not(windows))]
-        assert!(a.to_config().is_err());
+        assert!(a.to_context().is_err());
     }
 
     #[test]
@@ -292,5 +504,25 @@ mod tests {
     fn is_connection_error_ignores_sql_syntax() {
         let e = anyhow::anyhow!("Incorrect syntax near 'SELEC'");
         assert!(!is_connection_error(&e));
+    }
+
+    #[test]
+    fn only_the_showplan_xml_column_is_a_plan() {
+        assert!(is_plan_result(
+            ["Microsoft SQL Server 2005 XML Showplan"].into_iter()
+        ));
+        assert!(!is_plan_result(["ShowplanFlag", "Id"].into_iter()));
+        assert!(!is_plan_result(["Showplan"].into_iter()));
+        assert!(!is_plan_result(
+            ["Microsoft SQL Server 2005 XML Showplan", "Other"].into_iter()
+        ));
+        assert!(!is_plan_result(std::iter::empty()));
+    }
+
+    #[test]
+    fn rows_affected_message_pluralizes() {
+        assert_eq!(rows_affected_message(0), "(0 rows affected)");
+        assert_eq!(rows_affected_message(1), "(1 row affected)");
+        assert_eq!(rows_affected_message(2), "(2 rows affected)");
     }
 }

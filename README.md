@@ -1,6 +1,6 @@
 # ssms-search-rs
 
-Desktop **Object Explorer** inspired by SSMS, built with **egui/eframe** (finestra nativa Windows) + toolkit SQL Server in Rust.
+Desktop **Object Explorer** inspired by SSMS, built with **egui/eframe** (finestra nativa Windows) + **`mssql-tds`** (stesso driver TDS di Quervio: Messaggi, SSPI, money esatto).
 
 **Status:** `0.7.0-alpha.1` — Windows alpha (session worker, Windows Auth, multi-row filter).
 

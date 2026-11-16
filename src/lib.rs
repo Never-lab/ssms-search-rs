@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod connection;
 pub mod filter;
+pub mod format;
 pub mod functions;
 pub mod plan;
 pub mod trace;
